@@ -6,18 +6,23 @@ ComfyUI 本体（8188）のサーバに間借りするので、追加ポート�
 
 T2I 2分割ワークフロー（`T2I_HQ_A_explore` → `T2I_HQ_B_brushup`）の選別工程用。
 
-## デプロイ（RunPod）
+## デプロイ
 
-1. このフォルダを RunPod の ComfyUI 配下へ配置:
-   ```
-   /workspace/runpod-slim/ComfyUI/custom_nodes/comfyui-explore-gallery/
-   ```
-   （git 同期しているならそのまま。していなければ scp / コピーで配置）
-2. **ComfyUI を1回だけ再起動**（拡張ロードのため。以後は常時有効・追加操作不要）。
-3. ブラウザで開く:
-   ```
-   https://[podid]-8188.proxy.runpod.net/explore_gallery
-   ```
+ComfyUI の `custom_nodes/` 配下に **clone するだけ**（フォルダのアップロード不要）:
+
+```bash
+cd <ComfyUI>/custom_nodes
+git clone https://github.com/projectgk23/comfyui-explore-gallery.git
+```
+
+- **ComfyUI を1回だけ再起動**（拡張ロードのため。以後は常時有効・追加操作不要）。
+- ブラウザで開く: `http://<host>:8188/explore_gallery`
+  （RunPod なら `https://[podid]-8188.proxy.runpod.net/explore_gallery`）
+- 更新は: `git -C comfyui-explore-gallery pull`
+
+> RunPod では、セットアップスクリプト `runpod_setup_t2i_hq_AB.sh`（shared リポジトリ同梱）に
+> この clone が組み込まれているので、それを実行すれば自動で配置される。
+> Pod は ephemeral なので「Pod 作成 → スクリプト実行（clone 込み）→ ComfyUI 再起動」が基本フロー。
 
 ## 使い方
 
