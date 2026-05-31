@@ -16,6 +16,7 @@ let metaOpen = false;
 
 const BATCH = 120;       // how many figures to add per incremental render
 let rendered = 0;        // how many of `view` are in the DOM
+const promptCache = new Map();  // name -> {pos, neg} (lazy, cleared per folder)
 
 const $ = id => document.getElementById(id);
 const enc = encodeURIComponent;
@@ -75,6 +76,87 @@ const io = new IntersectionObserver((entries) => {
   if (entries.some(e => e.isIntersecting)) renderMore();
 }, { root: null, rootMargin: '800px' });
 
+// lazily fetch positive/negative prompts only for cards that scroll into view
+const pio = new IntersectionObserver((entries) => {
+  for (const e of entries) {
+    if (e.isIntersecting) { pio.unobserve(e.target); fillPrompts(e.target); }
+  }
+}, { root: null, rootMargin: '300px' });
+
+function extractPN(fields) {
+  let pos = '', neg = '';
+  for (const [k, v] of (fields || [])) {
+    if (k === 'Negative') neg = v;
+    else if (!pos && /^Prompt/.test(k)) pos = v;
+  }
+  return { pos: String(pos || ''), neg: String(neg || '') };
+}
+function setProw(fig, cls, text) {
+  const row = fig.querySelector('.prow.' + cls);
+  if (!row) return;
+  const tx = row.querySelector('.ptext');
+  const cp = row.querySelector('.copy');
+  if (text) {
+    tx.dataset.full = text;
+    tx.textContent = text.replace(/\s+/g, ' ').trim();
+    tx.title = text;
+    tx.classList.remove('empty');
+    cp.disabled = false;
+  } else {
+    tx.dataset.full = '';
+    tx.textContent = '—';
+    tx.title = '';
+    tx.classList.add('empty');
+    cp.disabled = true;
+  }
+}
+async function fillPrompts(fig) {
+  const name = fig.dataset.name;
+  let pn = promptCache.get(name);
+  if (!pn) {
+    try {
+      const r = await fetch('/explore_gallery/meta?dir=' + enc(curDir) + '&file=' + enc(name));
+      const d = await r.json();
+      pn = extractPN(d.fields);
+    } catch (e) { pn = { pos: '', neg: '' }; }
+    promptCache.set(name, pn);
+  }
+  setProw(fig, 'pos', pn.pos);
+  setProw(fig, 'neg', pn.neg);
+}
+async function copyText(btn, text) {
+  if (!text) return;
+  let ok = false;
+  try { await navigator.clipboard.writeText(text); ok = true; }
+  catch (e) {  // insecure context / older browser fallback
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { ok = document.execCommand('copy'); } catch (_) { ok = false; }
+    ta.remove();
+  }
+  if (ok) {
+    const old = btn.textContent;
+    btn.textContent = '✓'; btn.classList.add('done');
+    setTimeout(() => { btn.textContent = old; btn.classList.remove('done'); }, 900);
+  } else {
+    msg.textContent = 'コピーできませんでした';
+  }
+}
+function makeProw(cls, label) {
+  const row = document.createElement('div');
+  row.className = 'prow ' + cls;
+  const lb = document.createElement('span');
+  lb.className = 'plabel'; lb.textContent = label;
+  const tx = document.createElement('span');
+  tx.className = 'ptext'; tx.textContent = '…';
+  const cp = document.createElement('button');
+  cp.className = 'copy'; cp.textContent = '⧉'; cp.title = 'コピー'; cp.disabled = true;
+  cp.onclick = (e) => { e.stopPropagation(); copyText(cp, tx.dataset.full || ''); };
+  row.append(lb, tx, cp);
+  return row;
+}
+
 function makeFigure(f, i) {
   const fig = document.createElement('figure');
   if (sel.has(f.name)) fig.classList.add('sel');
@@ -97,13 +179,19 @@ function makeFigure(f, i) {
     + '<span class="meta">' + dim + ' · ' + fmtSize(f.size)
     + ' · ' + fmtDate(f.mtime) + '</span>';
 
-  fig.append(thumb, cap);
+  const prompts = document.createElement('div');
+  prompts.className = 'prompts';
+  prompts.onclick = (e) => e.stopPropagation();  // don't toggle selection here
+  prompts.append(makeProw('pos', 'P'), makeProw('neg', 'N'));
+
+  fig.append(thumb, cap, prompts);
   fig.onclick = () => {
     if (sel.has(f.name)) { sel.delete(f.name); fig.classList.remove('sel'); }
     else { sel.add(f.name); fig.classList.add('sel'); }
     refreshButtons();
   };
   fig.ondblclick = (e) => { e.preventDefault(); openLightbox(i); };
+  pio.observe(fig);  // lazily load P/N prompts when scrolled into view
   return fig;
 }
 
@@ -118,6 +206,7 @@ function renderMore() {
 }
 
 function renderReset() {
+  pio.disconnect();  // drop observers on figures we're about to discard
   grid.innerHTML = '';
   rendered = 0;
   grid.appendChild(sentinel);
@@ -160,6 +249,7 @@ async function loadDirs() {
 
 async function loadList() {
   msg.textContent = '読み込み中…';
+  promptCache.clear();  // prompts are folder-scoped (keyed by bare filename)
   try {
     const d = await (await fetch('/explore_gallery/list?dir=' + enc(curDir))).json();
     files = d.files || [];
