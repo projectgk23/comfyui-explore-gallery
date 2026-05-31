@@ -786,6 +786,103 @@ function applyThumbSize(px) {
 $('thumbsize').onchange = () => applyThumbSize($('thumbsize').value);
 $('autorefresh').onchange = () => setAuto($('autorefresh').checked);
 
+// ---- rubber-band (drag) selection ----
+function syncSelClasses() {
+  for (const fig of grid.querySelectorAll('figure'))
+    fig.classList.toggle('sel', sel.has(fig.dataset.key));
+}
+let marqStart = null, marqBox = null, marqBase = null, marqing = false, justDragged = false;
+
+grid.addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return;
+  // don't start on interactive bits (buttons, prompt rows, links, the scrollbar)
+  if (e.target.closest('button, select, input, a, .prompts')) return;
+  marqStart = { x: e.clientX, y: e.clientY };
+  // additive when a modifier is held; otherwise a fresh marquee replaces selection
+  marqBase = (e.shiftKey || e.ctrlKey || e.metaKey) ? new Set(sel) : new Set();
+  marqing = false;
+});
+window.addEventListener('mousemove', (e) => {
+  if (!marqStart) return;
+  const dx = e.clientX - marqStart.x, dy = e.clientY - marqStart.y;
+  if (!marqing) {
+    if (Math.abs(dx) + Math.abs(dy) < 6) return;   // movement threshold
+    marqing = true;
+    document.body.classList.add('marqing');
+    marqBox = document.createElement('div');
+    marqBox.id = 'marquee';
+    document.body.appendChild(marqBox);
+  }
+  const x1 = Math.min(e.clientX, marqStart.x), y1 = Math.min(e.clientY, marqStart.y);
+  const x2 = Math.max(e.clientX, marqStart.x), y2 = Math.max(e.clientY, marqStart.y);
+  marqBox.style.left = x1 + 'px'; marqBox.style.top = y1 + 'px';
+  marqBox.style.width = (x2 - x1) + 'px'; marqBox.style.height = (y2 - y1) + 'px';
+
+  const next = new Set(marqBase);
+  for (const fig of grid.querySelectorAll('figure')) {
+    const r = fig.getBoundingClientRect();
+    if (!(r.right < x1 || r.left > x2 || r.bottom < y1 || r.top > y2))
+      next.add(fig.dataset.key);
+  }
+  sel.clear(); for (const k of next) sel.add(k);
+  syncSelClasses(); refreshButtons();
+  e.preventDefault();
+});
+window.addEventListener('mouseup', () => {
+  if (!marqStart) return;
+  const wasDragging = marqing;
+  marqStart = null; marqing = false;
+  if (marqBox) { marqBox.remove(); marqBox = null; }
+  document.body.classList.remove('marqing');
+  if (wasDragging) { justDragged = true; setTimeout(() => { justDragged = false; }, 0); }
+});
+// swallow the click that fires right after a drag so it doesn't toggle a card
+grid.addEventListener('click', (e) => {
+  if (justDragged) { e.stopPropagation(); e.preventDefault(); }
+}, true);
+
+// ---- drag & drop upload from the OS (mainly for RunPod) ----
+const hasFiles = (e) => e.dataTransfer && [...(e.dataTransfer.types || [])].includes('Files');
+let dragDepth = 0;
+function showDrop() {
+  $('dropzone').querySelector('.dz-folder').textContent = dirLabel(curDir);
+  $('dropzone').hidden = false;
+}
+function hideDrop() { $('dropzone').hidden = true; }
+window.addEventListener('dragenter', (e) => {
+  if (!hasFiles(e)) return;
+  e.preventDefault(); dragDepth++; showDrop();
+});
+window.addEventListener('dragover', (e) => {
+  if (!hasFiles(e)) return;
+  e.preventDefault(); e.dataTransfer.dropEffect = 'copy';
+});
+window.addEventListener('dragleave', (e) => {
+  if (!hasFiles(e)) return;
+  dragDepth--; if (dragDepth <= 0) { dragDepth = 0; hideDrop(); }
+});
+window.addEventListener('drop', (e) => {
+  if (!hasFiles(e)) return;
+  e.preventDefault(); dragDepth = 0; hideDrop();
+  if (e.dataTransfer.files && e.dataTransfer.files.length)
+    uploadFiles(e.dataTransfer.files);
+});
+async function uploadFiles(fileList) {
+  const imgs = [...fileList].filter(f => /\.(png|jpe?g|webp|bmp|gif)$/i.test(f.name));
+  if (!imgs.length) { toast('画像ファイルが見つかりません', 'err'); return; }
+  const fd = new FormData();
+  for (const f of imgs) fd.append('files', f, f.name);
+  toast('アップロード中… (' + imgs.length + ' 枚)');
+  try {
+    const r = await fetch('/explore_gallery/upload?dir=' + enc(curDir), { method: 'POST', body: fd });
+    const d = await r.json();
+    const n = (d.saved || []).length, s = (d.skipped || []).length;
+    toast(n + ' 枚を「' + dirLabel(curDir) + '」へアップロード'
+      + (s ? '（' + s + ' 枚スキップ）' : ''), n ? 'ok' : 'err', 3500);
+    if (n) { lastStat = null; await refreshCurrent(); }
+  } catch (e) { toast('アップロードに失敗しました', 'err'); }
+}
+
 // ---- init persisted prefs ----
 (function initPrefs() {
   const t = localStorage.getItem('eg_thumb') || '190';

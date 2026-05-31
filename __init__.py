@@ -684,6 +684,56 @@ async def explore_gallery_zip(request):
         "Content-Disposition": f'attachment; filename="{label}.zip"',
     })
 
+@PromptServer.instance.routes.post("/explore_gallery/upload")
+async def explore_gallery_upload(request):
+    """Receive image files (multipart) dragged from the OS and store them into
+    the open folder. Intended for RunPod, where there is no desktop explorer."""
+    sub = request.query.get("dir", "")
+    d = _resolve_dir(sub)
+    if d is None:
+        return web.json_response({"error": "bad dir"}, status=400)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError as e:
+        return web.json_response({"error": str(e)}, status=400)
+
+    try:
+        reader = await request.multipart()
+    except Exception:  # noqa: BLE001
+        return web.json_response({"error": "expected multipart form"}, status=400)
+
+    saved, skipped = [], []
+    while True:
+        part = await reader.next()
+        if part is None:
+            break
+        if not part.filename:          # non-file field
+            await part.release()
+            continue
+        name = _safe_name(part.filename)
+        if name is None:
+            skipped.append({"file": part.filename, "reason": "unsupported type"})
+            await part.release()
+            continue
+        dest = _unique_dest(d, name)
+        try:
+            with open(dest, "wb") as fh:
+                while True:
+                    chunk = await part.read_chunk()
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+            saved.append(os.path.basename(dest))
+        except Exception as e:  # noqa: BLE001
+            skipped.append({"file": part.filename, "reason": str(e)})
+            try:
+                if os.path.exists(dest):
+                    os.remove(dest)
+            except OSError:
+                pass
+    return web.json_response({"saved": saved, "skipped": skipped, "dir": sub})
+
+
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
 # Loaded into ComfyUI's own page: enables "copy workflow in gallery → paste in

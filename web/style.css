@@ -48,7 +48,8 @@ figure { margin:0; position:relative; border:3px solid transparent;
          border-radius:8px; overflow:hidden; background:#111; cursor:pointer;
          content-visibility:auto; contain-intrinsic-size: 240px; }
 .thumb { position:relative; aspect-ratio:1/1; background:#000; }
-.thumb img { width:100%; height:100%; object-fit:contain; display:block; }
+.thumb img { width:100%; height:100%; object-fit:contain; display:block;
+        -webkit-user-drag:none; user-select:none; }
 /* click selects; selection is shown by the green frame + a corner tick badge */
 figure.sel { border-color:#3b6; }
 figure.sel::after { content:"✓"; position:absolute; top:6px; right:6px;
@@ -181,3 +182,19 @@ figcaption .fbadge { display:inline-block; background:#3a3f55; color:#bcd;
 .toast.show { opacity:1; transform:none; }
 .toast.ok  { border-left-color:#3b6; }
 .toast.err { border-left-color:#d55; }
+
+/* rubber-band (drag) selection */
+#marquee { position:fixed; z-index:50; pointer-events:none;
+        border:1px solid #6a8bff; background:#4a6cff26; border-radius:2px; }
+body.marqing { user-select:none; cursor:crosshair; }
+body.marqing #grid { cursor:crosshair; }
+
+/* OS drag-and-drop upload overlay */
+#dropzone { position:fixed; inset:0; z-index:150; pointer-events:none;
+        background:#0b0b0fd2; display:flex; align-items:center; justify-content:center; }
+#dropzone[hidden] { display:none; }
+#dropzone .dzbox { border:3px dashed #6a8bff; border-radius:16px;
+        padding:38px 60px; font-size:21px; color:#dfe6ff; text-align:center;
+        background:#1a1c2acc; box-shadow:0 8px 40px #0009; }
+#dropzone .dzbox .dz-folder { color:#9ab4ff; font-weight:700; }
+#dropzone .dzbox small { display:block; margin-top:10px; font-size:13px; opacity:.7; }
