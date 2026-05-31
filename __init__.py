@@ -82,36 +82,47 @@ def _dimensions(path, st):
     return wh
 
 
+def _count_images(d):
+    try:
+        return sum(1 for f in os.listdir(d)
+                   if f.lower().endswith(IMG_EXT)
+                   and os.path.isfile(os.path.join(d, f)))
+    except OSError:
+        return 0
+
+
 def _list_dirs():
-    """Top-level subfolders under output (hidden/_-prefixed excluded) plus the
-    root entry, each with an image count."""
+    """Return (visible, hidden) folder lists, each entry with an image count.
+
+    visible : the output root (if non-empty) and non-empty top-level folders.
+    hidden  : empty folders and "_"-prefixed bins (e.g. _trash) — accessible but
+              kept out of the main tab bar. "."-prefixed folders (e.g. the
+              .gallery_cache thumbnail cache) are never exposed.
+    """
     root = _output_root()
-    entries = []
+    visible, hidden = [], []
 
-    def count_images(d):
-        try:
-            return sum(1 for f in os.listdir(d)
-                       if f.lower().endswith(IMG_EXT)
-                       and os.path.isfile(os.path.join(d, f)))
-        except OSError:
-            return 0
-
-    root_count = count_images(root)
+    root_count = _count_images(root)
     if root_count:
-        entries.append({"dir": "", "label": "(ルート)", "count": root_count})
+        visible.append({"dir": "", "label": "(ルート)", "count": root_count})
 
     try:
         names = sorted(os.listdir(root), key=str.lower)
     except OSError:
         names = []
     for name in names:
-        if name.startswith((".", "_")):
+        if name.startswith("."):          # internal (.gallery_cache, dotfolders)
             continue
         p = os.path.join(root, name)
         if not os.path.isdir(p):
             continue
-        entries.append({"dir": name, "label": name, "count": count_images(p)})
-    return entries
+        cnt = _count_images(p)
+        entry = {"dir": name, "label": name, "count": cnt}
+        if name.startswith("_") or cnt < 1:
+            hidden.append(entry)          # _trash, or empty folders
+        else:
+            visible.append(entry)
+    return visible, hidden
 
 
 def _list_images(sub):
@@ -310,6 +321,57 @@ def _read_meta(path):
     return {"fields": fields, "raw": raw}
 
 
+def _png_text(path):
+    """Return the embedded text-chunk dict of an image (cheap for PNG: the
+    chunks are read at open() without decoding pixels)."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            text = getattr(im, "text", None)
+            if text:
+                return dict(text)
+            return {k: v for k, v in (im.info or {}).items()
+                    if isinstance(v, str)}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _meta_find(path, q):
+    """Return {"key", "snippet"} for the first embedded text chunk containing the
+    lowercase query (covers prompt text, model names, seeds, etc.), else None.
+    The snippet is a short window of context around the match."""
+    for k, v in _png_text(path).items():
+        if not isinstance(v, str):
+            continue
+        idx = v.lower().find(q)
+        if idx == -1:
+            continue
+        start = max(0, idx - 30)
+        end = min(len(v), idx + len(q) + 30)
+        snip = " ".join(v[start:end].split())
+        if start > 0:
+            snip = "…" + snip
+        if end < len(v):
+            snip = snip + "…"
+        return {"key": k, "snippet": snip}
+    return None
+
+
+def _read_workflow(path):
+    """Return the embedded ComfyUI graph: the UI `workflow` (loadable via
+    app.loadGraphData) and the API `prompt`, each parsed to an object or None."""
+    text = _png_text(path)
+    out = {"workflow": None, "prompt": None}
+    for key in ("workflow", "prompt"):
+        v = text.get(key)
+        if isinstance(v, str):
+            try:
+                out[key] = json.loads(v)
+            except Exception:  # noqa: BLE001
+                out[key] = None
+    return out
+
+
 # --------------------------------------------------------------------------- #
 #  Routes
 # --------------------------------------------------------------------------- #
@@ -363,13 +425,72 @@ async def explore_gallery_meta(request):
 
 @PromptServer.instance.routes.get("/explore_gallery/dirs")
 async def explore_gallery_dirs(request):
-    return web.json_response({"dirs": _list_dirs(), "dst": DST_SUB})
+    visible, hidden = _list_dirs()
+    return web.json_response({"dirs": visible, "hidden": hidden, "dst": DST_SUB})
 
 
 @PromptServer.instance.routes.get("/explore_gallery/list")
 async def explore_gallery_list(request):
     sub = request.query.get("dir", "")
     return web.json_response({"dir": sub, "dst": DST_SUB, "files": _list_images(sub)})
+
+
+@PromptServer.instance.routes.get("/explore_gallery/search")
+async def explore_gallery_search(request):
+    """Filename substring search across visible top-level folders (root +
+    non-prefixed). _trash, "_"-prefixed bins and "."-folders are excluded;
+    to search those, open the folder and filter within it client-side."""
+    q = (request.query.get("q") or "").strip().lower()
+    if not q:
+        return web.json_response({"q": "", "files": []})
+    do_meta = request.query.get("meta") in ("1", "true", "yes", "on")
+
+    root = _output_root()
+    subdirs = [""]  # root
+    try:
+        for name in sorted(os.listdir(root), key=str.lower):
+            if name.startswith((".", "_")):
+                continue
+            if os.path.isdir(os.path.join(root, name)):
+                subdirs.append(name)
+    except OSError:
+        pass
+
+    out = []
+    for sub in subdirs:
+        d = _resolve_dir(sub)
+        if d is None or not os.path.isdir(d):
+            continue
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            continue
+        for fn in entries:
+            low = fn.lower()
+            if not low.endswith(IMG_EXT):
+                continue
+            p = os.path.join(d, fn)
+            if not os.path.isfile(p):
+                continue
+            match = None
+            hit = q in low
+            if not hit and do_meta and low.endswith(".png"):
+                match = _meta_find(p, q)
+                hit = match is not None
+            if not hit:
+                continue
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            w, h = _dimensions(p, st)
+            entry = {"name": fn, "dir": sub, "mtime": st.st_mtime,
+                     "size": st.st_size, "w": w, "h": h}
+            if match:
+                entry["match"] = match
+            out.append(entry)
+    out.sort(key=lambda it: it["mtime"], reverse=True)
+    return web.json_response({"q": q, "meta": do_meta, "files": out})
 
 
 @PromptServer.instance.routes.post("/explore_gallery/move")
@@ -382,7 +503,12 @@ async def explore_gallery_move(request):
     src_dir = _resolve_dir(data.get("dir", ""))
     if src_dir is None:
         return web.json_response({"error": "bad dir"}, status=400)
-    dst_dir = _resolve_dir(DST_SUB)
+    dst_sub = data.get("dst")
+    if dst_sub is None:
+        dst_sub = DST_SUB
+    dst_dir = _resolve_dir(dst_sub)
+    if dst_dir is None:
+        return web.json_response({"error": "bad dst"}, status=400)
     os.makedirs(dst_dir, exist_ok=True)
 
     moved, skipped = [], []
@@ -396,14 +522,14 @@ async def explore_gallery_move(request):
             skipped.append({"file": raw, "reason": "not found"})
             continue
         if os.path.realpath(src_dir) == os.path.realpath(dst_dir):
-            skipped.append({"file": raw, "reason": "already in selected"})
+            skipped.append({"file": raw, "reason": "already there"})
             continue
         try:
             shutil.move(src, _unique_dest(dst_dir, name))
             moved.append(name)
         except Exception as e:  # noqa: BLE001
             skipped.append({"file": raw, "reason": str(e)})
-    return web.json_response({"moved": moved, "skipped": skipped})
+    return web.json_response({"moved": moved, "skipped": skipped, "dst": dst_sub})
 
 
 @PromptServer.instance.routes.post("/explore_gallery/trash")
@@ -439,6 +565,75 @@ async def explore_gallery_trash(request):
         except Exception as e:  # noqa: BLE001
             skipped.append({"file": raw, "reason": str(e)})
     return web.json_response({"trashed": trashed, "skipped": skipped})
+
+
+@PromptServer.instance.routes.post("/explore_gallery/delete")
+async def explore_gallery_delete(request):
+    """Permanently delete files (intended for emptying _trash). Irreversible."""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json"}, status=400)
+
+    src_dir = _resolve_dir(data.get("dir", ""))
+    if src_dir is None:
+        return web.json_response({"error": "bad dir"}, status=400)
+
+    deleted, skipped = [], []
+    for raw in (data.get("files") or []):
+        name = _safe_name(raw)
+        if name is None:
+            skipped.append({"file": raw, "reason": "invalid name"})
+            continue
+        p = os.path.join(src_dir, name)
+        if not os.path.isfile(p):
+            skipped.append({"file": raw, "reason": "not found"})
+            continue
+        try:
+            os.remove(p)
+            deleted.append(name)
+        except Exception as e:  # noqa: BLE001
+            skipped.append({"file": raw, "reason": str(e)})
+    return web.json_response({"deleted": deleted, "skipped": skipped})
+
+
+@PromptServer.instance.routes.get("/explore_gallery/stat")
+async def explore_gallery_stat(request):
+    """Lightweight folder fingerprint (image count + newest mtime) so the
+    client can poll cheaply and refresh only when something changed."""
+    d = _resolve_dir(request.query.get("dir", ""))
+    if d is None or not os.path.isdir(d):
+        return web.json_response({"count": 0, "latest": 0})
+    count, latest = 0, 0.0
+    try:
+        for fn in os.listdir(d):
+            if not fn.lower().endswith(IMG_EXT):
+                continue
+            p = os.path.join(d, fn)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if not os.path.isfile(p):
+                continue
+            count += 1
+            if st.st_mtime > latest:
+                latest = st.st_mtime
+    except OSError:
+        pass
+    return web.json_response({"count": count, "latest": latest})
+
+
+@PromptServer.instance.routes.get("/explore_gallery/workflow")
+async def explore_gallery_workflow(request):
+    d = _resolve_dir(request.query.get("dir", ""))
+    name = _safe_name(request.query.get("file", ""))
+    if d is None or name is None:
+        return web.json_response({"workflow": None, "prompt": None}, status=400)
+    p = os.path.join(d, name)
+    if not os.path.isfile(p):
+        return web.json_response({"workflow": None, "prompt": None}, status=404)
+    return web.json_response(_read_workflow(p))
 
 
 @PromptServer.instance.routes.get("/explore_gallery/download")
@@ -491,6 +686,8 @@ async def explore_gallery_zip(request):
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
-WEB_DIRECTORY = None
+# Loaded into ComfyUI's own page: enables "copy workflow in gallery → paste in
+# ComfyUI" by reading a handoff key from the (same-origin) localStorage.
+WEB_DIRECTORY = "./js"
 
 print("[explore-gallery] route ready: GET /explore_gallery")

@@ -9,19 +9,32 @@
 <body>
 <header>
   <div class="row" id="tabs"></div>
-  <div class="row">
+  <div class="row toolbar">
     <button id="reload">🔄 再読み込み</button>
+    <label class="flbl chk" title="新着画像を自動で取り込む">
+      <input type="checkbox" id="autorefresh"> 自動更新
+    </label>
+    <button id="dlfolder">⬇ フォルダZIP</button>
+    <span class="grow"></span>
+    <span id="count">0 / 0</span>
+  </div>
+  <div class="row selbar" id="selbar" hidden>
+    <span id="selinfo">0 枚選択中</span>
     <button id="all">全選択</button>
     <button id="none">全解除</button>
-    <button id="move" class="primary" disabled>→ selectedへ移動</button>
-    <button id="dl" disabled>⬇ 選択をDL</button>
-    <button id="dlfolder">⬇ フォルダZIP</button>
-    <button id="del" class="danger" disabled>🗑 ゴミ箱へ</button>
-    <span id="msg"></span>
-    <span id="count">0 / 0</span>
+    <span class="sep"></span>
+    <label class="flbl" id="dstwrap">移動先
+      <select id="dstsel"></select>
+    </label>
+    <button id="move" class="primary">→ 移動</button>
+    <button id="dl">⬇ DL</button>
+    <button id="del" class="danger">🗑 ゴミ箱へ</button>
   </div>
   <div class="row filters">
     <input id="search" type="search" placeholder="🔍 ファイル名で検索…" autocomplete="off">
+    <label class="flbl chk" title="プロンプト・モデル名・シードなど埋め込み情報も検索（やや時間がかかります）">
+      <input type="checkbox" id="metasearch"> メタも検索
+    </label>
     <label class="flbl">並び替え
       <select id="sortkey">
         <option value="mtime">日時</option>
@@ -30,6 +43,14 @@
       </select>
     </label>
     <button id="sortdir" title="昇順 / 降順">▼</button>
+    <span class="sep"></span>
+    <label class="flbl">表示
+      <select id="thumbsize">
+        <option value="140">小</option>
+        <option value="190">中</option>
+        <option value="260">大</option>
+      </select>
+    </label>
   </div>
 </header>
 <div id="grid"></div>
@@ -39,9 +60,10 @@
   <div class="stage">
     <button class="nav prev" id="lbprev">‹</button>
     <div class="imgwrap">
-      <img id="lbimg" alt="">
+      <img id="lbimg" alt="" draggable="false">
       <div class="lbtools">
         <button id="lbinfo" title="メタデータ">ℹ</button>
+        <button id="lbcopy" title="ワークフローをコピー（ComfyUIで Ctrl+V）">📋</button>
         <button id="lbsel" class="selbtn" title="選択トグル">✓</button>
         <button id="lbdl" title="ダウンロード">⬇</button>
         <button id="lbclose" title="閉じる">✕</button>
@@ -54,11 +76,13 @@
   <div class="film">
     <div class="filminfo">
       <span id="lbpos">0 / 0</span>
-      <span class="legend"><kbd>←</kbd><kbd>→</kbd> 送り　<kbd>↑</kbd> 選択　<kbd>↓</kbd> ゴミ箱　<kbd>i</kbd> 情報　<kbd>Esc</kbd> 閉じる</span>
+      <span class="legend"><kbd>←</kbd><kbd>→</kbd> 送り　<kbd>↑</kbd> 選択　<kbd>↓</kbd> ゴミ箱　<kbd>i</kbd> 情報　<kbd>c</kbd> WFコピー　ホイール 拡大　<kbd>Esc</kbd> 閉じる</span>
     </div>
     <div class="filmstrip" id="lbstrip"></div>
   </div>
 </div>
+
+<div id="toasts"></div>
 
 <script src="/explore_gallery/web/app.js"></script>
 </body>
