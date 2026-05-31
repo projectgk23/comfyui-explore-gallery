@@ -11,19 +11,26 @@ Open  https://[pod]-8188.proxy.runpod.net/explore_gallery .
 Paths are resolved via folder_paths.get_output_directory(), so the same file
 works locally and on RunPod (/workspace/runpod-slim/ComfyUI/output).
 """
+import hashlib
 import io
+import json
 import os
 import shutil
 import zipfile
+from urllib.parse import quote
 
 from aiohttp import web
 
 import folder_paths
 from server import PromptServer
 
-DST_SUB = "selected"   # move target
-TRASH_SUB = "_trash"   # recoverable bin (hidden from tabs: leading "_")
+DST_SUB = "selected"        # move target
+TRASH_SUB = "_trash"        # recoverable bin (hidden from tabs: leading "_")
+CACHE_SUB = ".gallery_cache"  # thumbnail cache (hidden from tabs: leading ".")
 IMG_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
+THUMB_MAX = 384             # longest edge of generated thumbnails (px)
+
+WEB_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "web")
 
 # cache: (path, mtime, size) -> (w, h)
 _dim_cache = {}
@@ -145,11 +152,213 @@ def _unique_dest(dst_dir, name):
 
 
 # --------------------------------------------------------------------------- #
+#  Thumbnails (persistent disk cache)
+# --------------------------------------------------------------------------- #
+def _cache_dir():
+    d = os.path.join(_output_root(), CACHE_SUB)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _thumb_key(path, st):
+    raw = f"{os.path.realpath(path)}|{st.st_mtime_ns}|{st.st_size}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _make_thumb(src, dst):
+    """Render a small WEBP thumbnail of `src` to `dst`. Returns True on success."""
+    tmp = dst + ".tmp"
+    try:
+        from PIL import Image
+        with Image.open(src) as im:
+            try:
+                im.draft("RGB", (THUMB_MAX, THUMB_MAX))  # speeds up JPEG decode
+            except Exception:  # noqa: BLE001
+                pass
+            im = im.convert("RGB")
+            im.thumbnail((THUMB_MAX, THUMB_MAX))
+            im.save(tmp, "WEBP", quality=80, method=4)
+        os.replace(tmp, dst)
+        return True
+    except Exception:  # noqa: BLE001 — missing PIL / unreadable file
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+# --------------------------------------------------------------------------- #
+#  Embedded metadata (ComfyUI writes prompt/workflow into PNG text chunks)
+# --------------------------------------------------------------------------- #
+_TEXT_KEYS = ("string", "prompt", "populated_text", "wildcard_text",
+              "value", "t5xxl", "clip_l", "clip_g")
+
+
+def _resolve_text(graph, ref, depth=4):
+    """Follow a graph link [node_id, slot] to the nearest node holding a literal
+    prompt string. Handles CLIPTextEncode (`text`) as well as upstream string
+    nodes that feed it via keys like `text`, `text_0`, `string`, etc."""
+    while depth > 0 and isinstance(ref, list) and ref:
+        node = graph.get(str(ref[0]))
+        if not isinstance(node, dict):
+            return None
+        ins = node.get("inputs")
+        if not isinstance(ins, dict):
+            return None
+        parts = []
+        for k, v in ins.items():
+            if isinstance(v, str) and (k == "text" or k.startswith("text")
+                                       or k in _TEXT_KEYS):
+                s = v.strip()
+                if s:
+                    parts.append(s)
+        if parts:
+            return "\n".join(parts)
+        nxt = ins.get("text")
+        ref = nxt if isinstance(nxt, list) else ins.get("conditioning")
+        depth -= 1
+    return None
+
+
+def _summarize_prompt(prompt_str):
+    """Best-effort extraction of common generation fields from a ComfyUI
+    API-prompt graph. Works across model types by scanning input keys."""
+    fields = []
+    if not prompt_str:
+        return fields
+    try:
+        graph = json.loads(prompt_str)
+    except Exception:  # noqa: BLE001
+        return fields
+    if not isinstance(graph, dict):
+        return fields
+
+    scalars = [
+        ("ckpt_name", "Model"), ("unet_name", "Model"), ("model_name", "Model"),
+        ("steps", "Steps"), ("cfg", "CFG"),
+        ("sampler_name", "Sampler"), ("scheduler", "Scheduler"),
+        ("seed", "Seed"), ("noise_seed", "Seed"),
+        ("width", "Width"), ("height", "Height"),
+        ("length", "Length"), ("frame_rate", "FPS"), ("fps", "FPS"),
+        ("vae_name", "VAE"),
+    ]
+    found = {}
+    texts = []
+    positive = negative = None
+    for node in graph.values():
+        if not isinstance(node, dict):
+            continue
+        ins = node.get("inputs")
+        if not isinstance(ins, dict):
+            continue
+        # sampler-style nodes link positive/negative conditioning -> resolve text
+        if positive is None and isinstance(ins.get("positive"), list):
+            positive = _resolve_text(graph, ins.get("positive"))
+        if negative is None and isinstance(ins.get("negative"), list):
+            negative = _resolve_text(graph, ins.get("negative"))
+        for k, v in ins.items():
+            if k == "text" and isinstance(v, str):
+                s = v.strip()
+                if s and s not in texts:
+                    texts.append(s)
+            for key, label in scalars:
+                if k == key and not isinstance(v, (list, dict)) and label not in found:
+                    found[label] = v
+
+    if positive:
+        fields.append(["Prompt", positive])
+    if negative:
+        fields.append(["Negative", negative])
+    if not positive and not negative:  # fallback: raw text nodes, unlabeled
+        for i, t in enumerate(texts[:2]):
+            fields.append(["Prompt" if i == 0 else f"Prompt {i + 1}", t])
+    for label in ("Model", "Steps", "CFG", "Sampler", "Scheduler",
+                  "Seed", "Width", "Height", "Length", "FPS", "VAE"):
+        if label in found:
+            fields.append([label, found[label]])
+    return fields
+
+
+def _read_meta(path):
+    info = {}
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            text = getattr(im, "text", None)
+            if text:
+                info = dict(text)
+            else:
+                info = {k: v for k, v in (im.info or {}).items()
+                        if isinstance(v, str)}
+    except Exception:  # noqa: BLE001
+        return {"fields": [], "raw": {}}
+
+    fields = _summarize_prompt(info.get("prompt"))
+    raw = {}
+    for k, v in info.items():
+        if not isinstance(v, str) or len(v) > 200000:
+            continue
+        try:  # parse JSON values so the client can pretty-print them
+            raw[k] = json.loads(v)
+        except Exception:  # noqa: BLE001
+            raw[k] = v
+    return {"fields": fields, "raw": raw}
+
+
+# --------------------------------------------------------------------------- #
 #  Routes
 # --------------------------------------------------------------------------- #
 @PromptServer.instance.routes.get("/explore_gallery")
 async def explore_gallery_page(request):
-    return web.Response(text=_PAGE, content_type="text/html")
+    index = os.path.join(WEB_DIR, "index.html")
+    if os.path.isfile(index):
+        return web.FileResponse(index)
+    return web.Response(status=500, text="explore-gallery: web/index.html missing")
+
+
+# static assets (style.css / app.js)
+PromptServer.instance.routes.static("/explore_gallery/web", WEB_DIR)
+
+
+@PromptServer.instance.routes.get("/explore_gallery/thumb")
+async def explore_gallery_thumb(request):
+    d = _resolve_dir(request.query.get("dir", ""))
+    name = _safe_name(request.query.get("file", ""))
+    if d is None or name is None:
+        return web.Response(status=400, text="bad request")
+    p = os.path.join(d, name)
+    if not os.path.isfile(p):
+        return web.Response(status=404, text="not found")
+    try:
+        st = os.stat(p)
+    except OSError:
+        return web.Response(status=404, text="not found")
+
+    cache = os.path.join(_cache_dir(), _thumb_key(p, st) + ".webp")
+    if not os.path.isfile(cache) and not _make_thumb(p, cache):
+        # PIL unavailable / unreadable: fall back to ComfyUI's on-the-fly preview
+        raise web.HTTPFound(
+            "/view?filename=%s&subfolder=%s&type=output&preview=webp"
+            % (quote(name), quote(request.query.get("dir", "")))
+        )
+    return web.FileResponse(cache, headers={"Cache-Control": "max-age=86400"})
+
+
+@PromptServer.instance.routes.get("/explore_gallery/meta")
+async def explore_gallery_meta(request):
+    d = _resolve_dir(request.query.get("dir", ""))
+    name = _safe_name(request.query.get("file", ""))
+    if d is None or name is None:
+        return web.json_response({"fields": [], "raw": {}}, status=400)
+    p = os.path.join(d, name)
+    if not os.path.isfile(p):
+        return web.json_response({"fields": [], "raw": {}}, status=404)
+    return web.json_response(_read_meta(p))
 
 
 @PromptServer.instance.routes.get("/explore_gallery/dirs")
@@ -279,408 +488,6 @@ async def explore_gallery_zip(request):
         "Content-Type": "application/zip",
         "Content-Disposition": f'attachment; filename="{label}.zip"',
     })
-
-
-# --------------------------------------------------------------------------- #
-#  Inline page (no separate web assets needed)
-# --------------------------------------------------------------------------- #
-_PAGE = """<!DOCTYPE html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Explore Gallery</title>
-<style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body { margin:0; background:#1b1b1f; color:#eee;
-         font-family: system-ui, "Segoe UI", sans-serif; }
-  header { position: sticky; top:0; z-index:10;
-           padding:10px 14px; background:#26262c; border-bottom:1px solid #3a3a42; }
-  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-  .row + .row { margin-top:8px; }
-  h1 { font-size:15px; margin:0 8px 0 0; font-weight:600; }
-  button { background:#3a3a44; color:#eee; border:1px solid #50505c;
-           border-radius:6px; padding:7px 12px; font-size:13px; cursor:pointer; }
-  button:hover:not(:disabled) { background:#46465c; }
-  button.primary { background:#3b6; border-color:#4c7; color:#04200f; font-weight:600; }
-  button.danger  { background:#a33; border-color:#c55; color:#fee; }
-  button:disabled { opacity:.4; cursor:default; }
-  .tab { background:#2f2f37; }
-  .tab.active { background:#4a6cff; border-color:#6a8bff; color:#fff; font-weight:600; }
-  .tab .cnt { opacity:.7; font-size:11px; margin-left:4px; }
-  #count { margin-left:auto; font-size:13px; opacity:.85; white-space:nowrap; }
-  #msg { font-size:12px; opacity:.85; min-width:80px; }
-  #grid { display:grid; gap:10px; padding:12px;
-          grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); }
-  figure { margin:0; position:relative; border:3px solid transparent;
-           border-radius:8px; overflow:hidden; background:#111; cursor:pointer; }
-  .thumb { position:relative; aspect-ratio:1/1; background:#000; }
-  .thumb img { width:100%; height:100%; object-fit:contain; display:block; }
-  figure.sel { border-color:#3b6; }
-  figure.sel .thumb::after { content:"✓"; position:absolute; top:5px; right:6px;
-           background:#3b6; color:#04200f; font-weight:700;
-           width:22px; height:22px; border-radius:50%; display:flex;
-           align-items:center; justify-content:center; font-size:14px; }
-  .zoom { position:absolute; top:5px; left:6px; width:24px; height:24px;
-          border-radius:6px; border:none; background:#000a; color:#fff;
-          font-size:13px; padding:0; display:none; align-items:center; justify-content:center; }
-  .thumb:hover .zoom { display:flex; }
-  figcaption { font-size:11px; padding:4px 6px; line-height:1.4;
-           background:#222; border-top:1px solid #333; }
-  figcaption .nm { display:block; white-space:nowrap; overflow:hidden;
-           text-overflow:ellipsis; }
-  figcaption .meta { opacity:.7; font-size:10px; }
-  #empty { padding:40px; text-align:center; opacity:.6; }
-
-  /* lightbox */
-  #lb { position:fixed; inset:0; background:#000d; z-index:100; display:none; }
-  #lb.open { display:flex; flex-direction:column; }
-  #lb .stage { flex:1; min-height:0; width:100%; display:flex;
-        align-items:center; justify-content:center; position:relative; }
-  .imgwrap { position:relative; display:inline-block; line-height:0; }
-  #lbimg { max-width:92vw; max-height:calc(100vh - 140px); display:block; cursor:zoom-out; }
-  /* filmstrip */
-  .film { flex:0 0 auto; height:118px; background:#0009; border-top:1px solid #333;
-        display:flex; flex-direction:column; }
-  .filminfo { display:flex; gap:16px; align-items:center; padding:5px 12px; font-size:12px; }
-  .filminfo #lbpos { font-weight:600; color:#9ab4ff; }
-  .filminfo .legend { opacity:.5; }
-  .filminfo .legend kbd { background:#3338; border:1px solid #5556; border-radius:4px;
-        padding:0 5px; font-family:inherit; font-size:11px; }
-  .filmstrip { flex:1; display:flex; gap:6px; overflow-x:auto; overflow-y:hidden;
-        padding:0 12px 8px; align-items:center; }
-  .filmstrip img { height:100%; aspect-ratio:1/1; object-fit:cover; flex:0 0 auto;
-        border:2px solid #0000; border-radius:4px; cursor:pointer; opacity:.55; }
-  .filmstrip img:hover { opacity:.85; }
-  .filmstrip img.cur { opacity:1; border-color:#4a6cff; box-shadow:0 0 0 2px #4a6cff; }
-  .lbtools { position:absolute; top:6px; right:6px; display:flex; gap:6px; z-index:2; }
-  .lbtools button { width:34px; height:34px; padding:0; border-radius:8px;
-        border:1px solid #0006; background:#000a; color:#fff; font-size:16px;
-        display:flex; align-items:center; justify-content:center; cursor:pointer; }
-  .lbtools button:hover { background:#000d; }
-  .lbtools .selbtn { color:#fff8; }
-  .lbtools .selbtn.on { background:#3b6; border-color:#4c7; color:#04200f; }
-  #lbcap { position:absolute; left:0; right:0; bottom:0; pointer-events:none;
-        font-size:12px; line-height:1.4; padding:6px 10px;
-        background:linear-gradient(transparent, #000c); color:#fff; }
-  #lbcap .meta { opacity:.75; margin-left:8px; }
-  #lb .nav { position:absolute; top:0; bottom:0; width:14%; border:none;
-        background:transparent; color:#fff8; font-size:48px; cursor:pointer; z-index:1; }
-  #lb .nav:hover { color:#fff; background:#ffffff14; }
-  #lb .prev { left:0; } #lb .next { right:0; }
-</style>
-</head>
-<body>
-<header>
-  <div class="row" id="tabs"></div>
-  <div class="row">
-    <button id="reload">🔄 再読み込み</button>
-    <button id="all">全選択</button>
-    <button id="none">全解除</button>
-    <button id="move" class="primary" disabled>→ selectedへ移動</button>
-    <button id="dl" disabled>⬇ 選択をDL</button>
-    <button id="dlfolder">⬇ フォルダZIP</button>
-    <button id="del" class="danger" disabled>🗑 ゴミ箱へ</button>
-    <span id="msg"></span>
-    <span id="count">0 / 0</span>
-  </div>
-</header>
-<div id="grid"></div>
-<div id="empty" hidden>このフォルダに画像がありません。</div>
-
-<div id="lb">
-  <div class="stage">
-    <button class="nav prev" id="lbprev">‹</button>
-    <div class="imgwrap">
-      <img id="lbimg" alt="">
-      <div class="lbtools">
-        <button id="lbsel" class="selbtn" title="選択トグル">✓</button>
-        <button id="lbdl" title="ダウンロード">⬇</button>
-        <button id="lbclose" title="閉じる">✕</button>
-      </div>
-      <div id="lbcap"></div>
-    </div>
-    <button class="nav next" id="lbnext">›</button>
-  </div>
-  <div class="film">
-    <div class="filminfo">
-      <span id="lbpos">0 / 0</span>
-      <span class="legend"><kbd>←</kbd><kbd>→</kbd> 送り　<kbd>↑</kbd> 選択　<kbd>↓</kbd> ゴミ箱　<kbd>Esc</kbd> 閉じる</span>
-    </div>
-    <div class="filmstrip" id="lbstrip"></div>
-  </div>
-</div>
-
-<script>
-const grid = document.getElementById('grid');
-const empty = document.getElementById('empty');
-const msg = document.getElementById('msg');
-const sel = new Set();
-let curDir = '';
-let dstDir = 'selected';
-let files = [];          // [{name,w,h,mtime,size}]
-let lbIndex = -1;
-
-const $ = id => document.getElementById(id);
-const enc = encodeURIComponent;
-
-function viewUrl(name, preview) {
-  let u = '/view?filename=' + enc(name) + '&subfolder=' + enc(curDir)
-        + '&type=output';
-  if (preview) u += '&preview=webp';
-  return u;
-}
-function fmtDate(ts) {
-  const d = new Date(ts * 1000);
-  const p = n => String(n).padStart(2, '0');
-  return d.getFullYear() + '-' + p(d.getMonth()+1) + '-' + p(d.getDate())
-       + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
-}
-function fmtSize(b) {
-  if (b >= 1048576) return (b/1048576).toFixed(1) + 'MB';
-  if (b >= 1024) return (b/1024).toFixed(0) + 'KB';
-  return b + 'B';
-}
-
-function refreshButtons() {
-  $('count').textContent = sel.size + ' / ' + files.length;
-  const has = sel.size > 0;
-  $('move').disabled = !has || curDir === dstDir;
-  $('dl').disabled = !has;
-  $('del').disabled = !has;
-  $('dlfolder').disabled = files.length === 0;
-}
-
-function renderTabs(dirs) {
-  const t = $('tabs');
-  t.innerHTML = '<h1>📂 Explore Gallery</h1>';
-  for (const d of dirs) {
-    const b = document.createElement('button');
-    b.className = 'tab' + (d.dir === curDir ? ' active' : '');
-    b.innerHTML = d.label + '<span class="cnt">' + d.count + '</span>';
-    b.onclick = () => { if (d.dir !== curDir) { curDir = d.dir; sel.clear(); loadList(); markActiveTab(); } };
-    b.dataset.dir = d.dir;
-    t.appendChild(b);
-  }
-}
-function markActiveTab() {
-  for (const b of document.querySelectorAll('#tabs .tab'))
-    b.classList.toggle('active', b.dataset.dir === curDir);
-}
-
-function render() {
-  grid.innerHTML = '';
-  empty.hidden = files.length > 0;
-  files.forEach((f, i) => {
-    const fig = document.createElement('figure');
-    if (sel.has(f.name)) fig.classList.add('sel');
-    fig.dataset.name = f.name;
-
-    const thumb = document.createElement('div');
-    thumb.className = 'thumb';
-    const img = document.createElement('img');
-    img.loading = 'lazy';
-    img.src = viewUrl(f.name, true);
-    const zoom = document.createElement('button');
-    zoom.className = 'zoom'; zoom.textContent = '🔍'; zoom.title = '拡大';
-    zoom.onclick = (e) => { e.stopPropagation(); openLightbox(i); };
-    thumb.append(img, zoom);
-
-    const cap = document.createElement('figcaption');
-    const dim = (f.w && f.h) ? (f.w + '×' + f.h) : '—';
-    cap.innerHTML = '<span class="nm">' + f.name + '</span>'
-      + '<span class="meta">' + dim + ' · ' + fmtSize(f.size)
-      + ' · ' + fmtDate(f.mtime) + '</span>';
-
-    fig.append(thumb, cap);
-    fig.onclick = () => {
-      if (sel.has(f.name)) { sel.delete(f.name); fig.classList.remove('sel'); }
-      else { sel.add(f.name); fig.classList.add('sel'); }
-      refreshButtons();
-    };
-    fig.ondblclick = (e) => { e.preventDefault(); openLightbox(i); };
-    grid.appendChild(fig);
-  });
-  refreshButtons();
-}
-
-async function loadDirs() {
-  const d = await (await fetch('/explore_gallery/dirs')).json();
-  dstDir = d.dst || 'selected';
-  const dirs = d.dirs || [];
-  if (!dirs.some(x => x.dir === curDir)) curDir = dirs.length ? dirs[0].dir : '';
-  renderTabs(dirs);
-}
-
-async function loadList() {
-  msg.textContent = '読み込み中…';
-  const d = await (await fetch('/explore_gallery/list?dir=' + enc(curDir))).json();
-  files = d.files || [];
-  dstDir = d.dst || dstDir;
-  for (const s of [...sel]) if (!files.some(f => f.name === s)) sel.delete(s);
-  render();
-  msg.textContent = '';
-}
-
-async function reloadAll() { await loadDirs(); await loadList(); }
-
-// ---- lightbox ----
-function openLightbox(i) {
-  lbIndex = i;
-  $('lb').classList.add('open');
-  buildStrip();
-  showLightbox();
-}
-function buildStrip() {
-  const s = $('lbstrip');
-  s.innerHTML = '';
-  files.forEach((f, i) => {
-    const t = document.createElement('img');
-    t.loading = 'lazy';
-    t.src = viewUrl(f.name, true);
-    t.dataset.i = i;
-    if (i === lbIndex) t.classList.add('cur');
-    t.onclick = () => { lbIndex = i; showLightbox(); };
-    s.appendChild(t);
-  });
-}
-function highlightStrip() {
-  const s = $('lbstrip');
-  for (const im of s.querySelectorAll('img'))
-    im.classList.toggle('cur', Number(im.dataset.i) === lbIndex);
-  const cur = s.querySelector('img.cur');
-  if (cur) cur.scrollIntoView({ inline: 'center', block: 'nearest' });
-}
-function showLightbox() {
-  const f = files[lbIndex];
-  if (!f) return;
-  $('lbimg').src = viewUrl(f.name, false);
-  const dim = (f.w && f.h) ? (f.w + '×' + f.h) : '—';
-  $('lbcap').innerHTML = '<b>' + f.name + '</b><span class="meta">'
-    + dim + ' · ' + fmtSize(f.size) + ' · ' + fmtDate(f.mtime) + '</span>';
-  $('lbpos').textContent = (lbIndex + 1) + ' / ' + files.length;
-  $('lbsel').classList.toggle('on', sel.has(f.name));
-  highlightStrip();
-}
-function closeLightbox() { $('lb').classList.remove('open'); lbIndex = -1; }
-function step(n) {
-  if (lbIndex < 0) return;
-  lbIndex = (lbIndex + n + files.length) % files.length;
-  showLightbox();
-}
-function toggleCurrentSel() {
-  const f = files[lbIndex];
-  if (!f) return;
-  if (sel.has(f.name)) sel.delete(f.name); else sel.add(f.name);
-  const fig = grid.querySelector('figure[data-name="' + CSS.escape(f.name) + '"]');
-  if (fig) fig.classList.toggle('sel', sel.has(f.name));
-  showLightbox();
-  refreshButtons();
-}
-async function trashCurrent() {
-  const f = files[lbIndex];
-  if (!f) return;
-  await fetch('/explore_gallery/trash', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ dir: curDir, files: [f.name] }),
-  });
-  sel.delete(f.name);
-  files.splice(lbIndex, 1);
-  msg.textContent = '1 枚をゴミ箱へ';
-  if (files.length === 0) { closeLightbox(); render(); loadDirs(); return; }
-  if (lbIndex >= files.length) lbIndex = files.length - 1;
-  render();        // grid
-  buildStrip();    // strip (indices shifted)
-  showLightbox();  // new current image
-  loadDirs();      // tab counts
-}
-const stop = (fn) => (e) => { e.stopPropagation(); fn(e); };
-$('lbclose').onclick = stop(closeLightbox);
-$('lbprev').onclick = stop(() => step(-1));
-$('lbnext').onclick = stop(() => step(1));
-$('lbdl').onclick = stop(() => { const f = files[lbIndex]; if (f) downloadOne(f.name); });
-$('lbsel').onclick = stop(toggleCurrentSel);
-// single-click the enlarged image (or the dark backdrop) returns to the grid
-$('lbimg').onclick = closeLightbox;
-$('lb').onclick = (e) => {
-  if (e.target === $('lb') || e.target.classList.contains('stage')) closeLightbox();
-};
-document.addEventListener('keydown', (e) => {
-  if (!$('lb').classList.contains('open')) return;
-  if (e.key === 'Escape') closeLightbox();
-  else if (e.key === 'ArrowLeft') { e.preventDefault(); step(-1); }
-  else if (e.key === 'ArrowRight') { e.preventDefault(); step(1); }
-  else if (e.key === 'ArrowUp') { e.preventDefault(); toggleCurrentSel(); }
-  else if (e.key === 'ArrowDown') { e.preventDefault(); trashCurrent(); }
-});
-
-// ---- downloads ----
-function downloadOne(name) {
-  const a = document.createElement('a');
-  a.href = '/explore_gallery/download?dir=' + enc(curDir) + '&file=' + enc(name);
-  a.download = name;
-  document.body.appendChild(a); a.click(); a.remove();
-}
-async function downloadZip(names) {
-  msg.textContent = 'ZIP生成中…';
-  const r = await fetch('/explore_gallery/zip', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ dir: curDir, files: names }),
-  });
-  const blob = await r.blob();
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = (curDir || 'output') + '.zip';
-  document.body.appendChild(a); a.click(); a.remove();
-  URL.revokeObjectURL(url);
-  msg.textContent = '';
-}
-
-// ---- toolbar ----
-$('reload').onclick = reloadAll;
-$('all').onclick = () => { files.forEach(f => sel.add(f.name)); render(); };
-$('none').onclick = () => { sel.clear(); render(); };
-$('move').onclick = async () => {
-  const picked = [...sel]; if (!picked.length) return;
-  $('move').disabled = true; msg.textContent = '移動中…';
-  const r = await fetch('/explore_gallery/move', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ dir: curDir, files: picked }),
-  });
-  const d = await r.json();
-  const sk = (d.skipped || []).length;
-  msg.textContent = (d.moved || []).length + ' 枚を selected へ移動'
-    + (sk ? ('（' + sk + ' 枚スキップ）') : '');
-  sel.clear(); await reloadAll();
-};
-$('del').onclick = async () => {
-  const picked = [...sel]; if (!picked.length) return;
-  if (!confirm(picked.length + ' 枚を _trash へ移動します。（後で復元できます）')) return;
-  $('del').disabled = true; msg.textContent = 'ゴミ箱へ移動中…';
-  const r = await fetch('/explore_gallery/trash', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ dir: curDir, files: picked }),
-  });
-  const d = await r.json();
-  const sk = (d.skipped || []).length;
-  msg.textContent = (d.trashed || []).length + ' 枚をゴミ箱へ'
-    + (sk ? ('（' + sk + ' 枚スキップ）') : '');
-  sel.clear(); await reloadAll();
-};
-$('dl').onclick = () => {
-  const picked = [...sel]; if (!picked.length) return;
-  if (picked.length === 1) downloadOne(picked[0]);
-  else downloadZip(picked);
-};
-$('dlfolder').onclick = () => { if (files.length) downloadZip([]); };
-
-reloadAll();
-</script>
-</body>
-</html>
-"""
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}

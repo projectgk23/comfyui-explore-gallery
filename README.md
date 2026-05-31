@@ -11,7 +11,7 @@ T2I 2分割ワークフロー（`T2I_HQ_A_explore` → `T2I_HQ_B_brushup`）の�
 ComfyUI の `custom_nodes/` 配下に **clone するだけ**（フォルダのアップロード不要）:
 
 ```bash
-cd <ComfyUI>/custom_nodes
+cd /workspace/runpod-slim/ComfyUI/custom_nodes
 git clone https://github.com/projectgk23/comfyui-explore-gallery.git
 ```
 
@@ -35,10 +35,14 @@ git clone https://github.com/projectgk23/comfyui-explore-gallery.git
 ## 機能
 
 - **フォルダ切替**: `output` ルート＋全サブフォルダをタブで切替（各タブに画像枚数表示）
+- **検索 / 並び替え**: ファイル名で絞り込み、日時 / 名前 / サイズで昇順・降順ソート
+- **高速サムネ**: WEBP サムネを `output/.gallery_cache/` に永続キャッシュ（初回のみ生成、以降は即表示）。`output/.gallery_cache` はタブ非表示
+- **段階描画**: スクロールに応じて少しずつ描画＆遅延読み込みするので、数百〜千枚規模でも軽い
 - **メタ表示**: 各画像にファイル名・解像度・サイズ・作成日時（mtime）を表示
 - **拡大表示**: サムネをダブルクリック（または左上の 🔍）で全解像度プレビュー。拡大画像をクリックで一覧へ戻る
-  - キー操作: `←` / `→` 送り、`↑` 選択トグル、`↓` ゴミ箱（`_trash`）へ、`Esc` 閉じる（凡例を画面下部に薄く表示）
-  - 画像右上にアイコン（選択 `✓` / ダウンロード `⬇` / 閉じる `✕`）
+  - キー操作: `←` / `→` 送り、`↑` 選択トグル、`↓` ゴミ箱（`_trash`）へ、`i` 情報パネル、`Esc` 閉じる（凡例を画面下部に薄く表示）
+  - 画像右上にアイコン（情報 `ℹ` / 選択 `✓` / ダウンロード `⬇` / 閉じる `✕`）
+  - **情報パネル** `ℹ`: PNG に埋め込まれた生成情報（プロンプト・モデル・Steps/CFG/Sampler/Seed など）を表示。生 JSON（prompt / workflow）も折りたたみで確認可
   - 画像下に**フィルムストリップ**（フォルダ内の前後サムネ・現在は太枠）と「N / 総数」を表示。サムネクリックでジャンプ
 - **選別移動**: クリックで選択 → 「→ selectedへ移動」で `output/selected` へ
 - **ゴミ箱**: 選択画像を `output/_trash` へ移動（復元可能。`_trash` はタブ非表示）
@@ -46,9 +50,12 @@ git clone https://github.com/projectgk23/comfyui-explore-gallery.git
 
 ## しくみ（エンドポイント）
 
-- `GET  /explore_gallery` … ギャラリー画面（HTML）
+- `GET  /explore_gallery` … ギャラリー画面（`web/index.html`）
+- `GET  /explore_gallery/web/*` … フロント資産（`style.css` / `app.js`）
 - `GET  /explore_gallery/dirs` … `output` 直下のフォルダ一覧（枚数付き）
 - `GET  /explore_gallery/list?dir=SUB` … 指定フォルダの画像一覧（名前/解像度/サイズ/日時、新しい順）
+- `GET  /explore_gallery/thumb?dir=SUB&file=NAME` … WEBP サムネ（永続キャッシュ。未生成なら生成、PIL 不可時は `/view` にフォールバック）
+- `GET  /explore_gallery/meta?dir=SUB&file=NAME` … PNG 埋め込みメタ（抽出フィールド＋生 JSON）
 - `POST /explore_gallery/move` … `{dir, files}` を `output/selected` へ移動
 - `POST /explore_gallery/trash` … `{dir, files}` を `output/_trash` へ移動（復元可能）
 - `GET  /explore_gallery/download?dir=SUB&file=NAME` … 単一ファイルDL
@@ -56,6 +63,17 @@ git clone https://github.com/projectgk23/comfyui-explore-gallery.git
 
 出力フォルダは `folder_paths.get_output_directory()` で解決するため、ローカル ComfyUI でも
 RunPod（`/workspace/runpod-slim/ComfyUI/output`）でも、そのまま動きます。
-画像配信は ComfyUI 既存の `/view` を再利用（`preview=webp` で軽量サムネ）。
-解像度の取得には Pillow を使用（ComfyUI に同梱）、結果は mtime+サイズでキャッシュ。
+サムネは Pillow（ComfyUI 同梱）で生成した WEBP を `output/.gallery_cache/` にキャッシュし、
+2 回目以降はディスクから即配信。フロントは `web/`（HTML/CSS/JS）に分離。
+
+## 構成
+
+```
+comfyui-explore-gallery/
+├── __init__.py   # ルート定義・サムネ生成・メタ抽出
+└── web/
+    ├── index.html
+    ├── style.css
+    └── app.js
+```
 

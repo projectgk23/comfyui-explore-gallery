@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Explore Gallery</title>
+<link rel="stylesheet" href="/explore_gallery/web/style.css">
+</head>
+<body>
+<header>
+  <div class="row" id="tabs"></div>
+  <div class="row">
+    <button id="reload">🔄 再読み込み</button>
+    <button id="all">全選択</button>
+    <button id="none">全解除</button>
+    <button id="move" class="primary" disabled>→ selectedへ移動</button>
+    <button id="dl" disabled>⬇ 選択をDL</button>
+    <button id="dlfolder">⬇ フォルダZIP</button>
+    <button id="del" class="danger" disabled>🗑 ゴミ箱へ</button>
+    <span id="msg"></span>
+    <span id="count">0 / 0</span>
+  </div>
+  <div class="row filters">
+    <input id="search" type="search" placeholder="🔍 ファイル名で検索…" autocomplete="off">
+    <label class="flbl">並び替え
+      <select id="sortkey">
+        <option value="mtime">日時</option>
+        <option value="name">名前</option>
+        <option value="size">サイズ</option>
+      </select>
+    </label>
+    <button id="sortdir" title="昇順 / 降順">▼</button>
+  </div>
+</header>
+<div id="grid"></div>
+<div id="empty" hidden>このフォルダに画像がありません。</div>
+
+<div id="lb">
+  <div class="stage">
+    <button class="nav prev" id="lbprev">‹</button>
+    <div class="imgwrap">
+      <img id="lbimg" alt="">
+      <div class="lbtools">
+        <button id="lbinfo" title="メタデータ">ℹ</button>
+        <button id="lbsel" class="selbtn" title="選択トグル">✓</button>
+        <button id="lbdl" title="ダウンロード">⬇</button>
+        <button id="lbclose" title="閉じる">✕</button>
+      </div>
+      <div id="lbcap"></div>
+    </div>
+    <aside id="lbmeta" hidden></aside>
+    <button class="nav next" id="lbnext">›</button>
+  </div>
+  <div class="film">
+    <div class="filminfo">
+      <span id="lbpos">0 / 0</span>
+      <span class="legend"><kbd>←</kbd><kbd>→</kbd> 送り　<kbd>↑</kbd> 選択　<kbd>↓</kbd> ゴミ箱　<kbd>i</kbd> 情報　<kbd>Esc</kbd> 閉じる</span>
+    </div>
+    <div class="filmstrip" id="lbstrip"></div>
+  </div>
+</div>
+
+<script src="/explore_gallery/web/app.js"></script>
+</body>
+</html>
