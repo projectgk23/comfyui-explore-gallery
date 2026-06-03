@@ -29,6 +29,8 @@ TRASH_SUB = "_trash"        # recoverable bin (hidden from tabs: leading "_")
 CACHE_SUB = ".gallery_cache"  # thumbnail cache (hidden from tabs: leading ".")
 IMG_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
 THUMB_MAX = 384             # longest edge of generated thumbnails (px)
+CACHE_MAX_BYTES = 500 * 1024 * 1024   # サムネキャッシュ総量の上限 (約500MB)
+CACHE_SWEEP_EVERY = 50      # この回数だけ新規サムネを作るごとに上限チェック
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "web")
 
@@ -102,9 +104,8 @@ def _list_dirs():
     root = _output_root()
     visible, hidden = [], []
 
-    root_count = _count_images(root)
-    if root_count:
-        visible.append({"dir": "", "label": "(ルート)", "count": root_count})
+    # ルート(output)は枚数0でも常にタブの最左に表示する
+    visible.append({"dir": "", "label": "(ルート)", "count": _count_images(root)})
 
     try:
         names = sorted(os.listdir(root), key=str.lower)
@@ -177,6 +178,90 @@ def _cache_dir():
 def _thumb_key(path, st):
     raw = f"{os.path.realpath(path)}|{st.st_mtime_ns}|{st.st_size}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _drop_thumb(path, st):
+    """指定ファイルに対応するキャッシュ済みサムネ(WEBP)を削除する。
+    移動/ゴミ箱/完全削除の直前に呼ぶことで孤児サムネの発生を抑える。
+    `st` は移動前に取得した os.stat 結果（mtime/size を含む）を渡す。"""
+    try:
+        cache = os.path.join(_cache_dir(), _thumb_key(path, st) + ".webp")
+        if os.path.isfile(cache):
+            os.remove(cache)
+    except OSError:
+        pass
+
+
+def _valid_thumb_keys():
+    """output 配下の全画像から、現在有効なサムネキャッシュキーの集合を作る。
+    キャッシュフォルダ自体は走査対象から除外する。"""
+    keys = set()
+    root = _output_root()
+    cache_real = os.path.realpath(_cache_dir())
+    for dirpath, dirnames, filenames in os.walk(root):
+        if os.path.realpath(dirpath) == cache_real:
+            dirnames[:] = []          # キャッシュ配下には降りない
+            continue
+        for fn in filenames:
+            if not fn.lower().endswith(IMG_EXT):
+                continue
+            p = os.path.join(dirpath, fn)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            if not os.path.isfile(p):
+                continue
+            keys.add(_thumb_key(p, st))
+    return keys
+
+
+def _enforce_cache_limit(max_bytes):
+    """キャッシュ総量が上限を超えていたら、古い順(mtime)に削除して収める。
+    削除した枚数を返す。"""
+    d = _cache_dir()
+    try:
+        entries, total = [], 0
+        for fn in os.listdir(d):
+            if not fn.endswith(".webp"):
+                continue
+            p = os.path.join(d, fn)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            entries.append((st.st_mtime, st.st_size, p))
+            total += st.st_size
+    except OSError:
+        return 0
+    if total <= max_bytes:
+        return 0
+    entries.sort()                     # 古いもの(mtime小)から
+    removed = 0
+    for _, size, p in entries:
+        if total <= max_bytes:
+            break
+        try:
+            os.remove(p)
+            total -= size
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+_thumb_writes_since_sweep = 0
+
+
+def _maybe_enforce_cache_limit():
+    """新規サムネ生成のたびに呼ぶ軽量フック。毎回全走査すると重いので、
+    CACHE_SWEEP_EVERY 回に一度だけ上限チェックを実行する。"""
+    global _thumb_writes_since_sweep
+    _thumb_writes_since_sweep += 1
+    if _thumb_writes_since_sweep < CACHE_SWEEP_EVERY:
+        return
+    _thumb_writes_since_sweep = 0
+    _enforce_cache_limit(CACHE_MAX_BYTES)
 
 
 def _make_thumb(src, dst):
@@ -402,13 +487,22 @@ async def explore_gallery_thumb(request):
         return web.Response(status=404, text="not found")
 
     cache = os.path.join(_cache_dir(), _thumb_key(p, st) + ".webp")
-    if not os.path.isfile(cache) and not _make_thumb(p, cache):
-        # PIL unavailable / unreadable: fall back to ComfyUI's on-the-fly preview
-        raise web.HTTPFound(
-            "/view?filename=%s&subfolder=%s&type=output&preview=webp"
-            % (quote(name), quote(request.query.get("dir", "")))
-        )
-    return web.FileResponse(cache, headers={"Cache-Control": "max-age=86400"})
+    if not os.path.isfile(cache):
+        if _make_thumb(p, cache):
+            _maybe_enforce_cache_limit()   # 新規生成時のみ上限チェック
+        else:
+            # PIL unavailable / unreadable: fall back to ComfyUI's on-the-fly
+            # preview. Forward the client's cache-buster (?v=) so the fallback
+            # can't serve a stale preview of a since-replaced same-named file.
+            raise web.HTTPFound(
+                "/view?filename=%s&subfolder=%s&type=output&preview=webp&v=%s"
+                % (quote(name), quote(request.query.get("dir", "")),
+                   quote(request.query.get("v", "")))
+            )
+    # The URL is content-addressed (?v=<mtime>-<size>), so the bytes for a given
+    # URL never change -> cache aggressively and immutably.
+    return web.FileResponse(
+        cache, headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 
 @PromptServer.instance.routes.get("/explore_gallery/meta")
@@ -525,7 +619,9 @@ async def explore_gallery_move(request):
             skipped.append({"file": raw, "reason": "already there"})
             continue
         try:
+            st = os.stat(src)
             shutil.move(src, _unique_dest(dst_dir, name))
+            _drop_thumb(src, st)        # 移動元のサムネキャッシュを破棄
             moved.append(name)
         except Exception as e:  # noqa: BLE001
             skipped.append({"file": raw, "reason": str(e)})
@@ -560,7 +656,9 @@ async def explore_gallery_trash(request):
             skipped.append({"file": raw, "reason": "not found"})
             continue
         try:
+            st = os.stat(p)
             shutil.move(p, _unique_dest(trash_dir, name))
+            _drop_thumb(p, st)          # 移動元のサムネキャッシュを破棄
             trashed.append(name)
         except Exception as e:  # noqa: BLE001
             skipped.append({"file": raw, "reason": str(e)})
@@ -590,7 +688,9 @@ async def explore_gallery_delete(request):
             skipped.append({"file": raw, "reason": "not found"})
             continue
         try:
+            st = os.stat(p)
             os.remove(p)
+            _drop_thumb(p, st)          # 完全削除時はサムネキャッシュも破棄
             deleted.append(name)
         except Exception as e:  # noqa: BLE001
             skipped.append({"file": raw, "reason": str(e)})
@@ -732,6 +832,37 @@ async def explore_gallery_upload(request):
             except OSError:
                 pass
     return web.json_response({"saved": saved, "skipped": skipped, "dir": sub})
+
+
+@PromptServer.instance.routes.post("/explore_gallery/cache/prune")
+async def explore_gallery_cache_prune(request):
+    """サムネキャッシュを整理する:
+      1) output 配下のどの画像にも対応しない孤児 WEBP を削除
+      2) 中断で残った *.tmp を削除
+      3) その上でなお上限(CACHE_MAX_BYTES)を超えていれば古い順に削除
+    削除枚数と解放バイト数を返す。"""
+    valid = _valid_thumb_keys()
+    d = _cache_dir()
+    removed, freed = 0, 0
+    try:
+        names = os.listdir(d)
+    except OSError:
+        names = []
+    for fn in names:
+        p = os.path.join(d, fn)
+        is_orphan_webp = fn.endswith(".webp") and fn[:-5] not in valid
+        is_tmp = fn.endswith(".tmp")
+        if not (is_orphan_webp or is_tmp):
+            continue
+        try:
+            sz = os.path.getsize(p)
+            os.remove(p)
+            removed += 1
+            freed += sz
+        except OSError:
+            pass
+    capped = _enforce_cache_limit(CACHE_MAX_BYTES)
+    return web.json_response({"removed": removed, "freed": freed, "capped": capped})
 
 
 NODE_CLASS_MAPPINGS = {}

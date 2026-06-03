@@ -42,8 +42,12 @@ const EXPAND_SVG =
   + '<path d="M8 3H3v5M16 3h5v5M21 16v5h-5M3 16v5h5"/></svg>';
 
 // ---- url helpers (per-file dir, so cross-folder results work) ----
-const thumbUrl = f => '/explore_gallery/thumb?dir=' + enc(f.dir) + '&file=' + enc(f.name);
-const fullUrl = f => '/view?filename=' + enc(f.name) + '&subfolder=' + enc(f.dir) + '&type=output';
+// ?v=<mtime>-<size> はキャッシュバスター。ファイル名が再利用されても（ComfyUI の連番は
+// 削除で空き番号を再利用する）内容が変われば URL も変わるので、ブラウザが削除済み画像の
+// 古いサムネ／プレビューをキャッシュから誤って返すのを防ぐ。
+const ver = f => '&v=' + (f.mtime || 0) + '-' + (f.size || 0);
+const thumbUrl = f => '/explore_gallery/thumb?dir=' + enc(f.dir) + '&file=' + enc(f.name) + ver(f);
+const fullUrl = f => '/view?filename=' + enc(f.name) + '&subfolder=' + enc(f.dir) + '&type=output' + ver(f);
 const dlUrl = f => '/explore_gallery/download?dir=' + enc(f.dir) + '&file=' + enc(f.name);
 const metaUrl = f => '/explore_gallery/meta?dir=' + enc(f.dir) + '&file=' + enc(f.name);
 const wfUrl = f => '/explore_gallery/workflow?dir=' + enc(f.dir) + '&file=' + enc(f.name);
@@ -761,6 +765,24 @@ $('dlfolder').onclick = async () => {
   toast('ZIP生成中…');
   try { await downloadZipDir(curDir, []); }
   catch (e) { toast('ZIPの生成に失敗しました', 'err'); }
+};
+function fmtBytes(n) {
+  if (!n) return '0 B';
+  const u = ['B', 'KB', 'MB', 'GB'];
+  let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i ? n.toFixed(1) : n) + ' ' + u[i];
+}
+$('prunecache').onclick = async () => {
+  const btn = $('prunecache');
+  btn.disabled = true; toast('キャッシュを整理中…');
+  try {
+    const r = await fetch('/explore_gallery/cache/prune', { method: 'POST' });
+    const d = await r.json();
+    const n = (d.removed || 0) + (d.capped || 0);
+    toast(n ? (n + ' 件を削除（' + fmtBytes(d.freed || 0) + ' 解放）') : '削除対象はありませんでした',
+      'ok', 3200);
+  } catch (e) { toast('キャッシュ整理に失敗しました', 'err'); }
+  finally { btn.disabled = false; }
 };
 
 // ---- filters ----
