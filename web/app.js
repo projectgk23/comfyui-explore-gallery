@@ -19,6 +19,7 @@ let metaOpen = false;
 let searchTimer = null;
 let quota = 0;               // target pick count (0 = off); just a soft guide
 let focusMode = false;       // "未判定のみ": hide decided (selected) items
+const scoreMap = new Map();  // composite key -> aesthetic score (0..1)
 
 const BATCH = 120;
 let rendered = 0;
@@ -213,6 +214,19 @@ function toggleSel(f, fig) {
   refreshButtons();
 }
 
+// aesthetic score pill in the figcaption (0-100, red→green); removed if unknown
+function setScoreBadge(fig, val) {
+  const cap = fig.querySelector('figcaption');
+  if (!cap) return;
+  let b = cap.querySelector('.score');
+  if (val === undefined || val === null) { if (b) b.remove(); return; }
+  if (!b) { b = document.createElement('span'); b.className = 'score'; cap.insertBefore(b, cap.firstChild); }
+  const pct = Math.round(val * 100);
+  b.textContent = pct;
+  b.title = '美的スコア ' + pct + ' / 100（アニメ特化）';
+  b.style.background = 'hsl(' + Math.round(val * 120) + ',65%,32%)';
+}
+
 function makeFigure(f, i) {
   const fig = document.createElement('figure');
   const k = keyOf(f);
@@ -260,6 +274,7 @@ function makeFigure(f, i) {
   prompts.append(makeProw('pos', 'P'), makeProw('neg', 'N'));
 
   fig.append(thumb, cap, prompts);
+  if (scoreMap.has(k)) setScoreBadge(fig, scoreMap.get(k));
   fig.onclick = () => toggleSel(f, fig);   // single click selects
   pio.observe(fig);
   return fig;
@@ -297,6 +312,12 @@ function applyView() {
   v.sort((a, b) => {
     let r;
     if (sortKey === 'name') r = a.name.localeCompare(b.name);
+    else if (sortKey === 'aes') {
+      // unscored items sort to the end regardless of direction
+      const sa = scoreMap.has(keyOf(a)) ? scoreMap.get(a.dir + '\n' + a.name) : -1;
+      const sb = scoreMap.has(keyOf(b)) ? scoreMap.get(b.dir + '\n' + b.name) : -1;
+      r = sa - sb;
+    }
     else r = (a[sortKey] || 0) - (b[sortKey] || 0);
     return r * sortDir;
   });
@@ -414,10 +435,75 @@ async function loadList() {
     files = (d.files || []).map(f => (f.dir = curDir, f));
     pruneSel();
     applyView();
+    loadCachedScores(curDir);   // fill badges from cache (no compute), async
   } catch (e) {
     files = []; applyView();
     toast('一覧の取得に失敗しました', 'err');
   }
+}
+
+// ---- aesthetic scores ----
+// pull already-cached scores for a folder and paint badges (cheap; no compute)
+async function loadCachedScores(dir) {
+  try {
+    const d = await (await fetch('/explore_gallery/scores?dir=' + enc(dir))).json();
+    const sc = d.scores || {};
+    let any = false;
+    for (const [name, val] of Object.entries(sc)) { scoreMap.set(dir + '\n' + name, val); any = true; }
+    if (!any) return;
+    for (const fig of grid.querySelectorAll('figure')) {
+      const v = scoreMap.get(fig.dataset.key);
+      if (v !== undefined) setScoreBadge(fig, v);
+    }
+    if (sortKey === 'aes') applyView();
+  } catch (e) { /* scores are optional */ }
+}
+function applyScores(dir, scores) {
+  for (const [name, val] of Object.entries(scores)) {
+    const k = dir + '\n' + name;
+    scoreMap.set(k, val);
+    const fig = grid.querySelector('figure[data-key="' + CSS.escape(k) + '"]');
+    if (fig) setScoreBadge(fig, val);
+  }
+}
+// compute scores for the items currently shown (chunked; server runs ONNX off-thread)
+async function computeScores() {
+  const todo = view.filter(f => !scoreMap.has(keyOf(f)));
+  if (!todo.length) {
+    toast('表示中の画像はすべて計算済みです', 'ok', 1800);
+    if (sortKey === 'aes') applyView();
+    return;
+  }
+  const btn = $('scorebtn');
+  btn.disabled = true;
+  const byDir = new Map();
+  for (const f of todo) { if (!byDir.has(f.dir)) byDir.set(f.dir, []); byDir.get(f.dir).push(f.name); }
+  let done = 0; const total = todo.length; const CH = 6;
+  try {
+    toast('美的スコア計算中… 0 / ' + total + '（初回はモデルDLで時間がかかります）', '', 4000);
+    for (const [dir, names] of byDir) {
+      for (let i = 0; i < names.length; i += CH) {
+        const chunk = names.slice(i, i + CH);
+        let d;
+        try {
+          const r = await fetch('/explore_gallery/scores', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ dir, files: chunk }),
+          });
+          d = await r.json();
+          if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+        } catch (e) {
+          toast('スコア計算に失敗しました: ' + e.message, 'err', 6000);
+          return;
+        }
+        applyScores(dir, d.scores || {});
+        done += chunk.length;
+        toast('美的スコア計算中… ' + done + ' / ' + total, '', 1200);
+      }
+    }
+    toast('美的スコア計算 完了（' + total + ' 枚）', 'ok', 2500);
+    if (sortKey === 'aes') applyView();
+  } finally { btn.disabled = false; }
 }
 
 async function doSearch() {
@@ -766,6 +852,7 @@ function setChecklist(open) {
 }
 $('checklist').onclick = () => setChecklist($('checkpanel').hidden);
 $('cpclose').onclick = () => setChecklist(false);
+$('scorebtn').onclick = computeScores;
 function getMoveDst() {
   let v = $('dstsel').value;
   if (v === '__new__') {
@@ -849,7 +936,12 @@ $('metasearch').onchange = () => {
   metaSearch = $('metasearch').checked;
   if (searchTerm.trim()) doSearch();
 };
-$('sortkey').onchange = () => { sortKey = $('sortkey').value; applyView(); };
+$('sortkey').onchange = () => {
+  sortKey = $('sortkey').value;
+  applyView();
+  if (sortKey === 'aes' && view.some(f => !scoreMap.has(keyOf(f))))
+    toast('未計算の画像があります。「⭐ 美的スコア」で計算してください', '', 3000);
+};
 $('sortdir').onclick = () => {
   sortDir = -sortDir;
   $('sortdir').textContent = sortDir < 0 ? '▼' : '▲';

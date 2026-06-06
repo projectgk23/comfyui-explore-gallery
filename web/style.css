@@ -91,6 +91,9 @@ figcaption .date { flex:0 0 auto; opacity:.6; font-size:10px; white-space:nowrap
 figcaption .fbadge { display:inline-block; background:#3a3f55; color:#bcd;
          font-size:9px; border-radius:3px; padding:0 4px; margin-right:4px;
          vertical-align:middle; }
+/* aesthetic score pill (0-100), colored red→green by value */
+figcaption .score { flex:0 0 auto; font-size:10px; font-weight:800; line-height:15px;
+         border-radius:3px; padding:0 5px; color:#fff; background:#555; }
 
 /* positive / negative prompt rows (lazy-filled) */
 .prompts { background:#222; padding:0 6px 6px; }

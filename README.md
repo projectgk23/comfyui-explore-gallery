@@ -58,6 +58,7 @@ git clone https://github.com/projectgk23/comfyui-explore-gallery.git
 - **選別クォータ（目安枚数）**: ツールバーの「目安」に枚数を入れると、ステータスが `選択 3 / 全 12 ・ 目安 5` のように出る。目安に達すると緑、超えると警告色（選択バーの枚数表示も連動）。**ブロックはしない**自制用の補助線。設定はブラウザに記憶
 - **未判定のみ（フォーカスモード）**: 「未判定のみ」ON で採用（選択）済みをグリッドから隠し、まだ判定していない画像だけを表示。`残り N ・ 採用 M` 表示でゴールが見える。キープを選ぶたびに消えて「残り」が減る。OFF で選択済みも戻る
 - **選別チェック観点パネル**: 「✅ チェック観点」（拡大表示中は `g` キー）で、指の破綻・四肢のねじれ・目の左右差など**アニメ選別の着眼点**をフロート表示。隅に出したまま選別できる
+- **美的スコア（アニメ特化）**: 「⭐ 美的スコア」で表示中の画像をスコアリング（0〜100、赤→緑のバッジ）。並び替えの「美的順」で良さげな順に並ぶので、上位だけ見て選別できる。モデルは `skytnt/anime-aesthetic`（ONNX, 約107MB）を**初回のみ自動DL**して `models/` に保存し、スコアは画像ごとに `.gallery_cache/scores.json` へキャッシュ（2回目以降は即表示）。重い推論はワーカースレッドで実行し ComfyUI サーバをブロックしない。あくまで一般的な見栄えの目安で、最終判断は人が行う前提
 - **拡大表示**: 全解像度プレビュー。**ホイールでズーム / ドラッグでパン**（クリックでも2倍ズーム・トグル）。背景 / `✕` / `Esc` で閉じる
   - キー操作: `←` / `→` 送り、`↑` 選択トグル、`↓` ゴミ箱（`_trash` では完全削除）、`i` 情報パネル、`c` ワークフローコピー、`g` チェック観点、`Esc` 閉じる
   - 画像右上にアイコン（情報 `ℹ` / WFコピー `📋` / 選択 `✓` / ダウンロード `⬇` / 閉じる `✕`）
@@ -80,6 +81,8 @@ git clone https://github.com/projectgk23/comfyui-explore-gallery.git
 - `POST /explore_gallery/trash` … `{dir, files}` を `output/_trash` へ移動（復元可能）
 - `POST /explore_gallery/delete` … `{dir, files}` を完全削除（不可逆。主に `_trash` を空にする用）
 - `POST /explore_gallery/upload?dir=SUB` … multipart の画像ファイル群を `output/<dir>` に保存（同名は自動リネーム）
+- `GET  /explore_gallery/scores?dir=SUB` … そのフォルダの**キャッシュ済み**美的スコア（計算はしない。バッジ／並び替えの初期表示用）
+- `POST /explore_gallery/scores` … `{dir, files}` の美的スコアを計算（未計算分のみ）してキャッシュし、`{scores:{name:score}, computed:N}` を返す。重みが無ければ初回に自動DL。推論はワーカースレッドで実行
 - `GET  /explore_gallery/download?dir=SUB&file=NAME` … 単一ファイルDL
 - `POST /explore_gallery/zip` … `{dir, files}`（空配列ならフォルダ全体）を ZIP でDL
 
@@ -92,7 +95,8 @@ RunPod（`/workspace/runpod-slim/ComfyUI/output`）でも、そのまま動き�
 
 ```
 comfyui-explore-gallery/
-├── __init__.py   # ルート定義・サムネ生成・メタ/ワークフロー抽出
+├── __init__.py   # ルート定義・サムネ生成・メタ/ワークフロー抽出・美的スコアリング
+├── models/                  # 美的スコアの重み（自動DL、.gitignore 済み）
 ├── js/
 │   └── explore_gallery.js   # ComfyUI 本体側に読み込まれる。Ctrl+V でギャラリーのワークフローを取り込む
 └── web/                     # ギャラリー画面のフロント（/explore_gallery で配信）

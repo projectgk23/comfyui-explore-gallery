@@ -11,11 +11,13 @@ Open  https://[pod]-8188.proxy.runpod.net/explore_gallery .
 Paths are resolved via folder_paths.get_output_directory(), so the same file
 works locally and on RunPod (/workspace/runpod-slim/ComfyUI/output).
 """
+import asyncio
 import hashlib
 import io
 import json
 import os
 import shutil
+import threading
 import zipfile
 from urllib.parse import quote
 
@@ -31,6 +33,17 @@ IMG_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
 THUMB_MAX = 384             # longest edge of generated thumbnails (px)
 CACHE_MAX_BYTES = 500 * 1024 * 1024   # サムネキャッシュ総量の上限 (約500MB)
 CACHE_SWEEP_EVERY = 50      # この回数だけ新規サムネを作るごとに上限チェック
+
+# Aesthetic scorer (anime-tuned). Weights auto-download on first use (~107MB) and
+# are cached in models/. Scores (0..1, higher = nicer) are cached per-image.
+SCORE_MODEL_NAME = "anime-aesthetic.onnx"
+SCORE_MODEL_REPO = "skytnt/anime-aesthetic"
+SCORE_MODEL_FILE = "model.onnx"
+SCORE_MODEL_URL = ("https://huggingface.co/%s/resolve/main/%s"
+                   % (SCORE_MODEL_REPO, SCORE_MODEL_FILE))
+SCORE_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "models")
+SCORE_SIZE = 768            # model input is [1,3,768,768]
+SCORES_FILE = "scores.json"  # under .gallery_cache : {thumb_key: score}
 
 WEB_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "web")
 
@@ -458,6 +471,156 @@ def _read_workflow(path):
 
 
 # --------------------------------------------------------------------------- #
+#  Aesthetic scoring (anime-tuned ONNX; lazy-loaded, results cached on disk)
+# --------------------------------------------------------------------------- #
+_score_session = None
+_score_lock = threading.Lock()     # guards model load + scores.json read/write
+_score_cache = None                # {thumb_key: float}
+
+
+def _scores_path():
+    return os.path.join(_cache_dir(), SCORES_FILE)
+
+
+def _load_scores():
+    global _score_cache
+    if _score_cache is None:
+        try:
+            with open(_scores_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            _score_cache = data if isinstance(data, dict) else {}
+        except Exception:  # noqa: BLE001 — missing / corrupt cache file
+            _score_cache = {}
+    return _score_cache
+
+
+def _save_scores():
+    if _score_cache is None:
+        return
+    try:
+        tmp = _scores_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_score_cache, f)
+        os.replace(tmp, _scores_path())
+    except OSError:
+        pass
+
+
+def _download_model(dst):
+    """Fetch the scorer weights. Tries huggingface_hub, then requests, then
+    urllib (some Windows Python builds lack OpenSSL applink for urllib, so the
+    earlier methods are preferred)."""
+    os.makedirs(SCORE_DIR, exist_ok=True)
+    errors = []
+
+    def via_hfhub():
+        from huggingface_hub import hf_hub_download
+        p = hf_hub_download(SCORE_MODEL_REPO, SCORE_MODEL_FILE)
+        shutil.copyfile(p, dst)
+
+    def via_requests():
+        import requests
+        with requests.get(SCORE_MODEL_URL, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            with open(dst, "wb") as f:
+                for chunk in r.iter_content(1 << 20):
+                    f.write(chunk)
+
+    def via_urllib():
+        import urllib.request
+        urllib.request.urlretrieve(SCORE_MODEL_URL, dst)
+
+    for fn in (via_hfhub, via_requests, via_urllib):
+        try:
+            fn()
+            if os.path.isfile(dst) and os.path.getsize(dst) > 1_000_000:
+                return
+        except Exception as e:  # noqa: BLE001 — try the next method
+            errors.append("%s: %s" % (fn.__name__, e))
+            try:
+                if os.path.exists(dst):
+                    os.remove(dst)
+            except OSError:
+                pass
+    raise RuntimeError("could not download aesthetic model (" + "; ".join(errors) + ")")
+
+
+def _get_session():
+    global _score_session
+    if _score_session is None:
+        with _score_lock:
+            if _score_session is None:
+                import onnxruntime as ort
+                path = os.path.join(SCORE_DIR, SCORE_MODEL_NAME)
+                if not os.path.isfile(path):
+                    _download_model(path)
+                avail = ort.get_available_providers()
+                prefer = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider")
+                          if p in avail] or ["CPUExecutionProvider"]
+                _score_session = ort.InferenceSession(path, providers=prefer)
+    return _score_session
+
+
+def _preprocess(path):
+    """Resize keeping aspect into a centered 768x768 pad, normalize to [0,1],
+    return an NCHW float32 batch (matches skytnt/anime-aesthetic)."""
+    import numpy as np
+    from PIL import Image
+    s = SCORE_SIZE
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+        w, h = im.size
+        if h > w:
+            nh, nw = s, max(1, round(s * w / h))
+        else:
+            nh, nw = max(1, round(s * h / w)), s
+        im = im.resize((nw, nh), Image.BILINEAR)
+        arr = np.zeros((s, s, 3), dtype=np.float32)
+        ph, pw = (s - nh) // 2, (s - nw) // 2
+        arr[ph:ph + nh, pw:pw + nw] = np.asarray(im, dtype=np.float32) / 255.0
+    return np.transpose(arr, (2, 0, 1))[None]
+
+
+def _compute_batch(d, names):
+    """Score the listed files in folder `d`, using/filling the disk cache.
+    Returns (scores_by_name, computed_count, error_or_None). Runs in a worker
+    thread so the ComfyUI server stays responsive."""
+    cache = _load_scores()
+    out, computed, err = {}, 0, None
+    sess = None
+    for raw in names:
+        name = _safe_name(raw)
+        if name is None:
+            continue
+        p = os.path.join(d, name)
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        if not os.path.isfile(p):
+            continue
+        key = _thumb_key(p, st)
+        if key in cache:
+            out[name] = cache[key]
+            continue
+        try:
+            if sess is None:
+                sess = _get_session()
+            val = float(sess.run(None, {"img": _preprocess(p)})[0].reshape(-1)[0])
+        except Exception as e:  # noqa: BLE001 — surface to the client, stop early
+            err = str(e)
+            break
+        with _score_lock:
+            cache[key] = val
+        out[name] = val
+        computed += 1
+    if computed:
+        with _score_lock:
+            _save_scores()
+    return out, computed, err
+
+
+# --------------------------------------------------------------------------- #
 #  Routes
 # --------------------------------------------------------------------------- #
 @PromptServer.instance.routes.get("/explore_gallery")
@@ -863,6 +1026,54 @@ async def explore_gallery_cache_prune(request):
             pass
     capped = _enforce_cache_limit(CACHE_MAX_BYTES)
     return web.json_response({"removed": removed, "freed": freed, "capped": capped})
+
+
+@PromptServer.instance.routes.get("/explore_gallery/scores")
+async def explore_gallery_scores_get(request):
+    """Return already-cached aesthetic scores for a folder (no compute), so the
+    client can show badges / sort instantly on load."""
+    d = _resolve_dir(request.query.get("dir", ""))
+    if d is None or not os.path.isdir(d):
+        return web.json_response({"scores": {}})
+    cache = _load_scores()
+    out = {}
+    try:
+        names = os.listdir(d)
+    except OSError:
+        names = []
+    for fn in names:
+        if not fn.lower().endswith(IMG_EXT):
+            continue
+        p = os.path.join(d, fn)
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        if not os.path.isfile(p):
+            continue
+        key = _thumb_key(p, st)
+        if key in cache:
+            out[fn] = cache[key]
+    return web.json_response({"scores": out})
+
+
+@PromptServer.instance.routes.post("/explore_gallery/scores")
+async def explore_gallery_scores_post(request):
+    """Compute (and cache) aesthetic scores for the listed files. Heavy ONNX
+    work is offloaded to a thread so the server event loop is not blocked."""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json"}, status=400)
+    d = _resolve_dir(data.get("dir", ""))
+    if d is None or not os.path.isdir(d):
+        return web.json_response({"error": "bad dir"}, status=400)
+    names = data.get("files") or []
+    loop = asyncio.get_event_loop()
+    out, computed, err = await loop.run_in_executor(None, _compute_batch, d, names)
+    if err:
+        return web.json_response({"error": err, "scores": out}, status=500)
+    return web.json_response({"scores": out, "computed": computed})
 
 
 NODE_CLASS_MAPPINGS = {}

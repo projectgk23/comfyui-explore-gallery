@@ -5,3 +5,5 @@ __pycache__/
 Thumbs.db
 .idea/
 .vscode/
+# aesthetic scorer weights (auto-downloaded on first use; ~107MB)
+models/*.onnx
