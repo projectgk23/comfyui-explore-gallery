@@ -20,12 +20,21 @@ button:disabled { opacity:.4; cursor:default; }
 .tab.active { background:#4a6cff; border-color:#6a8bff; color:#fff; font-weight:600; }
 .tab .cnt { opacity:.7; font-size:11px; margin-left:4px; }
 #count { font-size:13px; opacity:.85; white-space:nowrap; }
+#count.over { color:#ffb454; opacity:1; font-weight:700; }
+#count.reached { color:#6dd28a; opacity:1; font-weight:700; }
+/* quota input + checklist toggle in the toolbar */
+#quota { width:54px; background:#1f1f25; color:#eee; border:1px solid #50505c;
+        border-radius:6px; padding:5px 6px; font-size:13px; }
+#quota:focus { outline:none; border-color:#6a8bff; }
+.toolbar .flbl.chk { font-size:12px; opacity:.85; }
+#checklist.on { background:#4a6cff; border-color:#6a8bff; color:#fff; font-weight:600; }
 
 /* contextual selection action bar (shown only when something is selected) */
 .selbar { background:#21212a; border:1px solid #3a3a46; border-radius:8px;
         padding:7px 10px; }
 .selbar[hidden] { display:none; }
 #selinfo { font-size:12px; font-weight:600; color:#9ab4ff; white-space:nowrap; }
+#selinfo.over { color:#ffb454; }
 .flbl.chk { gap:5px; cursor:pointer; }
 .flbl.chk input { accent-color:#4a6cff; }
 #dstsel { max-width:180px; }
@@ -52,6 +61,9 @@ figure { margin:0; position:relative; border:3px solid transparent;
         -webkit-user-drag:none; user-select:none; }
 /* click selects; selection is shown by the green frame + a corner tick badge */
 figure.sel { border-color:#3b6; }
+/* fade-out when an item is decided in "未判定のみ" (focus) mode */
+figure.removing { opacity:0; transform:scale(.85);
+        transition:opacity .18s ease, transform .18s ease; pointer-events:none; }
 figure.sel::after { content:"✓"; position:absolute; top:6px; right:6px;
         width:24px; height:24px; border-radius:50%; background:#3b6; color:#04200f;
         font-size:14px; font-weight:800; line-height:24px; text-align:center;
@@ -198,3 +210,19 @@ body.marqing #grid { cursor:crosshair; }
         background:#1a1c2acc; box-shadow:0 8px 40px #0009; }
 #dropzone .dzbox .dz-folder { color:#9ab4ff; font-weight:700; }
 #dropzone .dzbox small { display:block; margin-top:10px; font-size:13px; opacity:.7; }
+
+/* selection-checklist panel (floats; stays usable over the lightbox too) */
+#checkpanel { position:fixed; left:14px; bottom:14px; z-index:180;
+        width:min(340px, 92vw); max-height:74vh; overflow:auto;
+        background:#16161bf5; border:1px solid #3a3a46; border-left:4px solid #4a6cff;
+        border-radius:10px; padding:12px 14px; box-shadow:0 8px 30px #000a;
+        font-size:12px; line-height:1.55; }
+#checkpanel[hidden] { display:none; }
+#checkpanel .cphead { display:flex; align-items:center; justify-content:space-between;
+        gap:8px; font-weight:700; color:#9ab4ff; font-size:13px; margin-bottom:8px; }
+#checkpanel .cphead button { width:26px; height:26px; padding:0; font-size:13px; }
+#checkpanel ul { margin:0; padding-left:18px; }
+#checkpanel li { margin:5px 0; }
+#checkpanel li b { color:#cdd6ff; }
+#checkpanel .cpfoot { margin-top:10px; padding-top:8px; border-top:1px solid #3a3a46;
+        opacity:.8; font-size:11px; line-height:1.5; }

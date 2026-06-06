@@ -16,6 +16,14 @@
     </label>
     <button id="dlfolder">⬇ フォルダZIP</button>
     <button id="prunecache" title="未使用のサムネキャッシュ（孤児・残骸）を削除し、上限超過分も整理">🧹 キャッシュ整理</button>
+    <button id="checklist" title="選別の判断観点（指の破綻・四肢のねじれ等）を表示">✅ チェック観点</button>
+    <span class="sep"></span>
+    <label class="flbl chk" title="このバッチから選ぶ目安の枚数。超えると警告だけ出します（ブロックはしません）">目安
+      <input type="number" id="quota" min="0" step="1" inputmode="numeric" placeholder="—">
+    </label>
+    <label class="flbl chk" title="採用（選択）済みを隠し、まだ判定していない画像だけを表示">
+      <input type="checkbox" id="focus"> 未判定のみ
+    </label>
     <span class="grow"></span>
     <span id="count">0 / 0</span>
   </div>
@@ -77,7 +85,7 @@
   <div class="film">
     <div class="filminfo">
       <span id="lbpos">0 / 0</span>
-      <span class="legend"><kbd>←</kbd><kbd>→</kbd> 送り　<kbd>↑</kbd> 選択　<kbd>↓</kbd> ゴミ箱　<kbd>i</kbd> 情報　<kbd>c</kbd> WFコピー　ホイール 拡大　<kbd>Esc</kbd> 閉じる</span>
+      <span class="legend"><kbd>←</kbd><kbd>→</kbd> 送り　<kbd>↑</kbd> 選択　<kbd>↓</kbd> ゴミ箱　<kbd>i</kbd> 情報　<kbd>c</kbd> WFコピー　<kbd>g</kbd> チェック観点　ホイール 拡大　<kbd>Esc</kbd> 閉じる</span>
     </div>
     <div class="filmstrip" id="lbstrip"></div>
   </div>
@@ -86,6 +94,21 @@
 <div id="dropzone" hidden>
   <div class="dzbox">📥 「<span class="dz-folder"></span>」にアップロード
     <small>ここにドロップして画像を追加</small></div>
+</div>
+
+<div id="checkpanel" hidden>
+  <div class="cphead">✅ 選別チェック観点 <button id="cpclose" title="閉じる">✕</button></div>
+  <ul>
+    <li><b>手・指</b>：指の本数（6本/欠け）、長さ・癒着、関節の不自然な曲がり</li>
+    <li><b>腕・脚</b>：ねじれ・向き、関節の逆折れ、左右で太さ・長さが不揃い</li>
+    <li><b>目</b>：左右の大きさ・形・視線の不一致、つぶれ、ハイライト位置</li>
+    <li><b>顔</b>：輪郭の歪み、口・歯の崩れ、左右非対称、耳の位置</li>
+    <li><b>全身の解剖</b>：余分な手足、首・胴の長さ、肩の付き根、関節の数</li>
+    <li><b>接合・癒着</b>：体と背景・他者・小物の溶け、境界の崩れ</li>
+    <li><b>服・小物</b>：左右非対称、模様・ロゴの破綻、消えた紐や装飾</li>
+    <li><b>仕上げ</b>：ピント・質感ムラ、プロンプト指定との一致、構図の意図通りか</li>
+  </ul>
+  <div class="cpfoot">完璧を1周で求めない｜1パス目＝明らかなボツだけ🗑｜2パス目＝「未判定のみ」表示で目安枚数まで選ぶ</div>
 </div>
 
 <div id="toasts"></div>

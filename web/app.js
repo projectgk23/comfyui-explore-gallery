@@ -17,6 +17,8 @@ let sortKey = 'mtime';       // mtime | name | size
 let sortDir = -1;            // 1 = ascending, -1 = descending
 let metaOpen = false;
 let searchTimer = null;
+let quota = 0;               // target pick count (0 = off); just a soft guide
+let focusMode = false;       // "未判定のみ": hide decided (selected) items
 
 const BATCH = 120;
 let rendered = 0;
@@ -84,11 +86,33 @@ function toast(text, type = '', life = 2600) {
 }
 
 // ---- selection bar ----
+// number of still-undecided (not selected) items in the current view
+function undecidedCount() {
+  let n = 0;
+  for (const f of view) if (!sel.has(keyOf(f))) n++;
+  return n;
+}
+// status readout (top-right): remaining in focus mode, else selected / total,
+// plus the optional pick quota with an over/at-target highlight
+function updateStatus() {
+  const c = $('count');
+  let txt = focusMode
+    ? ('残り ' + undecidedCount() + ' ・ 採用 ' + sel.size)
+    : ('選択 ' + sel.size + ' / 全 ' + view.length);
+  if (quota > 0) txt += ' ・ 目安 ' + quota;
+  c.textContent = txt;
+  c.classList.toggle('over', quota > 0 && sel.size > quota);
+  c.classList.toggle('reached', quota > 0 && sel.size === quota);
+}
 function refreshButtons() {
-  $('count').textContent = sel.size + ' / ' + view.length;
+  updateStatus();
   const has = sel.size > 0;
   $('selbar').hidden = !has;
-  $('selinfo').textContent = sel.size + ' 枚選択中';
+  const si = $('selinfo');
+  si.textContent = quota > 0
+    ? (sel.size + ' / ' + quota + ' 選択中')
+    : (sel.size + ' 枚選択中');
+  si.classList.toggle('over', quota > 0 && sel.size > quota);
   const del = $('del');
   if (isTrash()) {
     del.textContent = '❌ 完全削除';
@@ -176,10 +200,16 @@ const pio = new IntersectionObserver((entries) => {
   }
 }, { root: null, rootMargin: '300px' });
 
+function fadeRemove(fig) {   // visually drop a decided card (data stays in `view`)
+  fig.classList.add('removing');
+  setTimeout(() => fig.remove(), 190);
+}
 function toggleSel(f, fig) {
   const k = keyOf(f);
   if (sel.has(k)) sel.delete(k); else sel.add(k);
-  fig.classList.toggle('sel', sel.has(k));
+  const on = sel.has(k);
+  fig.classList.toggle('sel', on);
+  if (focusMode && on) fadeRemove(fig);   // decided → hide so only undecided remain
   refreshButtons();
 }
 
@@ -262,7 +292,8 @@ function applyView() {
   if (q && searchResults) base = searchResults;                          // cross-folder
   else if (q) base = files.filter(f => f.name.toLowerCase().includes(q)); // local
   else base = files;
-  const v = base.slice();
+  // "未判定のみ": drop already-decided (selected) items; trashed are gone already
+  const v = focusMode ? base.filter(f => !sel.has(keyOf(f))) : base.slice();
   v.sort((a, b) => {
     let r;
     if (sortKey === 'name') r = a.name.localeCompare(b.name);
@@ -499,7 +530,10 @@ function toggleCurrentSel() {
   const k = keyOf(f);
   if (sel.has(k)) sel.delete(k); else sel.add(k);
   const fig = grid.querySelector('figure[data-key="' + CSS.escape(k) + '"]');
-  if (fig) fig.classList.toggle('sel', sel.has(k));
+  if (fig) {
+    fig.classList.toggle('sel', sel.has(k));
+    if (focusMode && sel.has(k)) fadeRemove(fig);   // keep grid in sync with focus mode
+  }
   showLightbox();
   refreshButtons();
 }
@@ -651,6 +685,7 @@ document.addEventListener('keydown', (e) => {
   else if (e.key === 'c' || e.key === 'C') {
     e.preventDefault(); const f = view[lbIndex]; if (f) copyWorkflow(f, $('lbcopy'));
   }
+  else if (e.key === 'g' || e.key === 'G') { e.preventDefault(); setChecklist($('checkpanel').hidden); }
 });
 
 // ---- downloads ----
@@ -704,14 +739,33 @@ async function bulkOp(url, extra) {
 $('reload').onclick = () => { lastStat = null; refreshCurrent(); };
 $('all').onclick = () => {
   view.forEach(f => sel.add(keyOf(f)));
-  for (const fig of grid.querySelectorAll('figure')) fig.classList.add('sel');
-  refreshButtons();
+  if (focusMode) applyView();   // all decided → grid empties (残り 0)
+  else { for (const fig of grid.querySelectorAll('figure')) fig.classList.add('sel'); refreshButtons(); }
 };
 $('none').onclick = () => {
   sel.clear();
-  for (const fig of grid.querySelectorAll('figure')) fig.classList.remove('sel');
+  if (focusMode) applyView();   // nothing decided → bring everything back
+  else { for (const fig of grid.querySelectorAll('figure')) fig.classList.remove('sel'); refreshButtons(); }
+};
+// pick-quota (soft guide) + "未判定のみ" focus mode + checklist panel
+$('quota').oninput = () => {
+  const v = parseInt($('quota').value, 10);
+  quota = (Number.isFinite(v) && v > 0) ? v : 0;
+  localStorage.setItem('eg_quota', quota);
   refreshButtons();
 };
+$('focus').onchange = () => {
+  focusMode = $('focus').checked;
+  localStorage.setItem('eg_focus', focusMode ? '1' : '0');
+  applyView();
+};
+function setChecklist(open) {
+  $('checkpanel').hidden = !open;
+  $('checklist').classList.toggle('on', open);
+  localStorage.setItem('eg_check', open ? '1' : '0');
+}
+$('checklist').onclick = () => setChecklist($('checkpanel').hidden);
+$('cpclose').onclick = () => setChecklist(false);
 function getMoveDst() {
   let v = $('dstsel').value;
   if (v === '__new__') {
@@ -913,6 +967,11 @@ async function uploadFiles(fileList) {
   const auto = localStorage.getItem('eg_auto') === '1';
   $('autorefresh').checked = auto;
   if (auto) setAuto(true);
+  const qv = parseInt(localStorage.getItem('eg_quota'), 10);
+  if (Number.isFinite(qv) && qv > 0) { quota = qv; $('quota').value = qv; }
+  focusMode = localStorage.getItem('eg_focus') === '1';
+  $('focus').checked = focusMode;
+  if (localStorage.getItem('eg_check') === '1') setChecklist(true);
 })();
 
 reloadAll();
